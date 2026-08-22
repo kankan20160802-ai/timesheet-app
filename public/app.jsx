@@ -97,24 +97,39 @@ function roundToUnit(minutes, unit, direction) {
   return Math.round(minutes / unit) * unit;
 }
 
-function EmployeeTimesheet() {
-  const [startDate, setStartDate] = useState("2026-07-19");
-  const [numWeeks, setNumWeeks] = useState(4);
-  const [unit, setUnit] = useState(15);
-  const [target, setTarget] = useState("punch"); // punch | daily | weekly
-  const [checkinDir, setCheckinDir] = useState("up");
-  const [checkoutDir, setCheckoutDir] = useState("down");
-  const [genericDir, setGenericDir] = useState("down");
-  const [weeklyLimitH, setWeeklyLimitH] = useState(28);
-  const [entries, setEntries] = useState({});
+const DRAFT_KEY = "timesheet_draft_v1";
 
-  const [periodMode, setPeriodMode] = useState("profile"); // 'profile' | 'manual'
-  const [targetMonth, setTargetMonth] = useState("2026-08");
-  const [profiles, setProfiles] = useState([
-    { id: "p1", name: "会社A(20日締め)", closingDay: "20", unit: 5, target: "punch", checkinDir: "up", checkoutDir: "down", genericDir: "down", weeklyLimitH: 28 },
-    { id: "p2", name: "会社B(末日締め)", closingDay: "endOfMonth", unit: 15, target: "daily", checkinDir: "up", checkoutDir: "down", genericDir: "down", weeklyLimitH: 28 },
-  ]);
-  const [selectedProfileId, setSelectedProfileId] = useState("p1");
+function loadDraft() {
+  try {
+    const raw = window.localStorage.getItem(DRAFT_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+const DEFAULT_PROFILES = [
+  { id: "p1", name: "会社A(20日締め)", closingDay: "20", unit: 5, target: "punch", checkinDir: "up", checkoutDir: "down", genericDir: "down", weeklyLimitH: 28 },
+  { id: "p2", name: "会社B(末日締め)", closingDay: "endOfMonth", unit: 15, target: "daily", checkinDir: "up", checkoutDir: "down", genericDir: "down", weeklyLimitH: 28 },
+];
+
+function EmployeeTimesheet() {
+  const draft = React.useRef(loadDraft()).current;
+
+  const [startDate, setStartDate] = useState(draft.startDate || "2026-07-19");
+  const [numWeeks, setNumWeeks] = useState(draft.numWeeks || 4);
+  const [unit, setUnit] = useState(draft.unit || 15);
+  const [target, setTarget] = useState(draft.target || "punch"); // punch | daily | weekly
+  const [checkinDir, setCheckinDir] = useState(draft.checkinDir || "up");
+  const [checkoutDir, setCheckoutDir] = useState(draft.checkoutDir || "down");
+  const [genericDir, setGenericDir] = useState(draft.genericDir || "down");
+  const [weeklyLimitH, setWeeklyLimitH] = useState(draft.weeklyLimitH || 28);
+  const [entries, setEntries] = useState(draft.entries || {});
+
+  const [periodMode, setPeriodMode] = useState(draft.periodMode || "profile"); // 'profile' | 'manual'
+  const [targetMonth, setTargetMonth] = useState(draft.targetMonth || "2026-08");
+  const [profiles, setProfiles] = useState(draft.profiles && draft.profiles.length ? draft.profiles : DEFAULT_PROFILES);
+  const [selectedProfileId, setSelectedProfileId] = useState(draft.selectedProfileId || "p1");
   const [newProfileName, setNewProfileName] = useState("");
   const [newProfileClosing, setNewProfileClosing] = useState("20");
   const [attachments, setAttachments] = useState([]);
@@ -122,9 +137,34 @@ function EmployeeTimesheet() {
   const [ocrStatus, setOcrStatus] = useState("idle"); // idle | loading | done | error
   const [ocrMessage, setOcrMessage] = useState("");
   const [previewMode, setPreviewMode] = useState(false);
-  const [employeeName, setEmployeeName] = useState("");
-  const [workplaceName, setWorkplaceName] = useState("");
+  const [employeeName, setEmployeeName] = useState(draft.employeeName || "");
+  const [workplaceName, setWorkplaceName] = useState(draft.workplaceName || "");
   const [autoName, setAutoName] = useState({ employeeName: false, workplaceName: false });
+
+  React.useEffect(() => {
+    const data = {
+      startDate, numWeeks, unit, target, checkinDir, checkoutDir, genericDir, weeklyLimitH,
+      entries, periodMode, targetMonth, profiles, selectedProfileId, employeeName, workplaceName,
+    };
+    try {
+      window.localStorage.setItem(DRAFT_KEY, JSON.stringify(data));
+    } catch (e) {
+      // 容量オーバー等は無視(致命的ではない)
+    }
+  }, [startDate, numWeeks, unit, target, checkinDir, checkoutDir, genericDir, weeklyLimitH, entries, periodMode, targetMonth, profiles, selectedProfileId, employeeName, workplaceName]);
+
+  function clearDraft() {
+    if (!window.confirm("この端末に保存されている下書きを消去し、新しい入力を始めますか?")) return;
+    try {
+      window.localStorage.removeItem(DRAFT_KEY);
+    } catch (e) {}
+    setEntries({});
+    setEmployeeName("");
+    setWorkplaceName("");
+    setAttachments([]);
+    setActiveAttachmentId(null);
+  }
+
   function compressImage(dataUrl, maxDim = 1600, quality = 0.85) {
     return new Promise((resolve) => {
       const img = new Image();
@@ -454,9 +494,26 @@ function EmployeeTimesheet() {
         }}
       >
         <div style={{ fontSize: 12, color: "var(--ink-soft)" }}>
-          {previewMode ? "PDF出力プレビュー中(実際に印刷される内容の見た目です)" : "編集モード"}
+          {previewMode ? "PDF出力プレビュー中(実際に印刷される内容の見た目です)" : "編集モード ・ この端末に自動保存されています"}
         </div>
         <div style={{ display: "flex", gap: 8 }}>
+          {!previewMode && (
+            <button
+              onClick={clearDraft}
+              style={{
+                padding: "8px 14px",
+                borderRadius: 8,
+                fontSize: 13,
+                fontWeight: 600,
+                border: "1px solid var(--line)",
+                background: "#fff",
+                color: "var(--ink-soft)",
+                cursor: "pointer",
+              }}
+            >
+              下書きを消去(新規入力)
+            </button>
+          )}
           <button
             onClick={() => setPreviewMode((v) => !v)}
             style={{
