@@ -140,19 +140,20 @@ function EmployeeTimesheet() {
   const [employeeName, setEmployeeName] = useState(draft.employeeName || "");
   const [workplaceName, setWorkplaceName] = useState(draft.workplaceName || "");
   const [creatorName, setCreatorName] = useState(draft.creatorName || "");
+  const [priorEntries, setPriorEntries] = useState(draft.priorEntries || {});
   const [autoName, setAutoName] = useState({ employeeName: false, workplaceName: false });
 
   React.useEffect(() => {
     const data = {
       startDate, numWeeks, unit, target, checkinDir, checkoutDir, genericDir, weeklyLimitH,
-      entries, periodMode, targetMonth, profiles, selectedProfileId, employeeName, workplaceName, creatorName,
+      entries, periodMode, targetMonth, profiles, selectedProfileId, employeeName, workplaceName, creatorName, priorEntries,
     };
     try {
       window.localStorage.setItem(DRAFT_KEY, JSON.stringify(data));
     } catch (e) {
       // 容量オーバー等は無視(致命的ではない)
     }
-  }, [startDate, numWeeks, unit, target, checkinDir, checkoutDir, genericDir, weeklyLimitH, entries, periodMode, targetMonth, profiles, selectedProfileId, employeeName, workplaceName, creatorName]);
+  }, [startDate, numWeeks, unit, target, checkinDir, checkoutDir, genericDir, weeklyLimitH, entries, periodMode, targetMonth, profiles, selectedProfileId, employeeName, workplaceName, creatorName, priorEntries]);
 
   function clearDraft() {
     if (!window.confirm("この端末に保存されている下書きを消去し、新しい入力を始めますか?")) return;
@@ -160,6 +161,7 @@ function EmployeeTimesheet() {
       window.localStorage.removeItem(DRAFT_KEY);
     } catch (e) {}
     setEntries({});
+    setPriorEntries({});
     setEmployeeName("");
     setWorkplaceName("");
     setCreatorName("");
@@ -285,8 +287,26 @@ function EmployeeTimesheet() {
   }
 
   function getEntry(dateStr) {
-    return entries[dateStr] || { checkin: "", breakStart: "", breakEnd: "", checkout: "", auto: {} };
+    return entries[dateStr] || priorEntries[dateStr] || { checkin: "", breakStart: "", breakEnd: "", checkout: "", auto: {} };
   }
+
+  function getPriorEntry(dateStr) {
+    return priorEntries[dateStr] || { checkin: "", breakStart: "", breakEnd: "", checkout: "" };
+  }
+
+  function updatePriorEntry(dateStr, field, value) {
+    setPriorEntries((prev) => ({ ...prev, [dateStr]: { ...(prev[dateStr] || {}), [field]: value } }));
+  }
+
+  const priorRefDates = useMemo(() => {
+    const base = periodMode === "profile" && period ? period.start : startDate;
+    const out = [];
+    for (let i = 6; i >= 1; i--) {
+      out.push(toDateStr(addDays(base, -i)));
+    }
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [periodMode, period && period.start, startDate]);
 
   const allPeriodDays = useMemo(() => weeks.flat(), [weeks]);
 
@@ -419,6 +439,27 @@ function EmployeeTimesheet() {
 
   const grandOvertime = weekSummaries.reduce((a, w) => a + w.overtime, 0);
   const grandTotal = weekSummaries.reduce((a, w) => a + w.total, 0);
+
+  // 「暦週(日〜土)」だけでなく、どの曜日から数えても連続7日間で28時間を超えていないかチェックする
+  const rollingChecks = useMemo(() => {
+    const limitMin = Math.round(weeklyLimitH * 60);
+    return allPeriodDays.map(({ dateStr }) => {
+      let total = 0;
+      let hasAnyData = false;
+      for (let i = 0; i < 7; i++) {
+        const ds = toDateStr(addDays(dateStr, -i));
+        const c = computeDay(ds);
+        if (c.hasData) {
+          hasAnyData = true;
+          total += c.workMin;
+        }
+      }
+      return { dateStr, total, over: total > limitMin, hasAnyData };
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allPeriodDays, entries, priorEntries, unit, target, checkinDir, checkoutDir, genericDir, weeklyLimitH]);
+
+  const rollingViolations = rollingChecks.filter((r) => r.over);
 
   return (
     <div style={{ background: "var(--bg)", minHeight: "100%", fontFamily: "var(--font-body)" }}>
@@ -928,6 +969,50 @@ function EmployeeTimesheet() {
           )}
         </div>
 
+        {/* Prior-period reference days (for accurate rolling 7-day check at the start of the period) */}
+        <div className="no-print" style={{ background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 10, padding: "16px 24px", marginBottom: 20 }}>
+          <div style={{ fontFamily: "var(--font-display)", fontWeight: 600, fontSize: 14, color: "var(--ink)", marginBottom: 4 }}>
+            前期間末の参考データ(任意)
+          </div>
+          <p style={{ fontSize: 12, color: "var(--ink-soft)", marginTop: 0, marginBottom: 12, lineHeight: 1.6 }}>
+            期間の最初の数日の「連続7日間チェック」を正確にするための補助入力です。表やPDFには出ず、ローリングチェックの計算にのみ使われます。
+            同じ人の前期間のデータが残っている場合は入力不要です。
+          </p>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+              <thead>
+                <tr style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>
+                  {["日付", "出社", "休憩開始", "休憩終了", "退社"].map((h) => (
+                    <th key={h} style={{ padding: "6px 8px", textAlign: "center", fontWeight: 600 }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {priorRefDates.map((dateStr) => {
+                  const pe = getPriorEntry(dateStr);
+                  return (
+                    <tr key={dateStr} style={{ borderTop: "1px solid var(--line)" }}>
+                      <td style={{ padding: "6px 10px", fontFamily: "var(--font-mono)", color: "var(--ink-soft)", textAlign: "center" }}>{dateStr}</td>
+                      <td style={{ padding: "6px 8px", textAlign: "center" }}>
+                        <input className="ts-input" placeholder="—" value={pe.checkin || ""} onChange={(ev) => updatePriorEntry(dateStr, "checkin", ev.target.value)} />
+                      </td>
+                      <td style={{ padding: "6px 8px", textAlign: "center" }}>
+                        <input className="ts-input" placeholder="—" value={pe.breakStart || ""} onChange={(ev) => updatePriorEntry(dateStr, "breakStart", ev.target.value)} />
+                      </td>
+                      <td style={{ padding: "6px 8px", textAlign: "center" }}>
+                        <input className="ts-input" placeholder="—" value={pe.breakEnd || ""} onChange={(ev) => updatePriorEntry(dateStr, "breakEnd", ev.target.value)} />
+                      </td>
+                      <td style={{ padding: "6px 8px", textAlign: "center" }}>
+                        <input className="ts-input" placeholder="—" value={pe.checkout || ""} onChange={(ev) => updatePriorEntry(dateStr, "checkout", ev.target.value)} />
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
         {/* Config panel */}
         <div className="no-print" style={{ background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 10, padding: "20px 24px", marginBottom: 16 }}>
           <div style={{ fontFamily: "var(--font-display)", fontWeight: 600, fontSize: 15, color: "var(--ink)", marginBottom: 14 }}>
@@ -1055,6 +1140,45 @@ function EmployeeTimesheet() {
               })}
             </tbody>
           </table>
+        </div>
+
+        <div style={{ background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 10, marginBottom: 20, overflow: "hidden" }}>
+          <div style={{ padding: "12px 20px", borderBottom: "1px solid var(--line)", fontFamily: "var(--font-display)", fontWeight: 600, fontSize: 14, color: "var(--ink)" }}>
+            連続7日間チェック(どの曜日から数えても28時間以内か)
+          </div>
+          <div style={{ padding: "14px 20px" }}>
+            <p style={{ fontSize: 12, color: "var(--ink-soft)", marginTop: 0, marginBottom: 12, lineHeight: 1.6 }}>
+              資格外活動の週28時間ルールは「日曜〜土曜」ではなく「連続する7日間(どの曜日を起点にしても)」で判定されます。
+              このチェックは、表示期間内の各日を終点として、その日を含む直近7日間の合計を確認しています。
+              ※期間の最初の数日を正確に判定するには、上部の「前期間末の参考データ」に前の6日分を入力してください(未入力の場合、期間開始前は0時間として計算されます)。
+            </p>
+            {rollingViolations.length === 0 ? (
+              <div style={{ fontSize: 13, color: "var(--accent)", fontWeight: 600 }}>
+                この期間内で、連続7日間28時間超過は検出されませんでした。
+              </div>
+            ) : (
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+                <thead>
+                  <tr style={{ background: "var(--warn-soft)", color: "var(--warn)" }}>
+                    {["終点の日", "対象7日間", "合計"].map((h) => (
+                      <th key={h} style={{ padding: "8px 10px", textAlign: "center", fontWeight: 600 }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {rollingViolations.map((r) => (
+                    <tr key={r.dateStr} style={{ borderTop: "1px solid var(--line)" }}>
+                      <td style={{ padding: "6px 10px", textAlign: "center", fontFamily: "var(--font-mono)" }}>{r.dateStr}</td>
+                      <td style={{ padding: "6px 10px", textAlign: "center", fontFamily: "var(--font-mono)", color: "var(--ink-soft)" }}>
+                        {toDateStr(addDays(r.dateStr, -6))} 〜 {r.dateStr}
+                      </td>
+                      <td style={{ padding: "6px 10px", textAlign: "center", fontFamily: "var(--font-mono)", fontWeight: 700, color: "var(--warn)" }}>{formatDuration(r.total)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
         </div>
 
         {/* Weeks */}
