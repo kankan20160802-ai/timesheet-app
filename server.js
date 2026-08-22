@@ -96,6 +96,24 @@ app.use((req, res, next) => {
 
 app.use(express.static(path.join(__dirname, "public")));
 
+// ---- レート制限(セッション単位で短時間の連打を防止) ----
+const OCR_RATE_LIMIT = 6; // 直近5分間に許可する読み取り回数
+const OCR_RATE_WINDOW_MS = 5 * 60 * 1000;
+const ocrCallLog = new Map(); // token(またはip) -> [timestamp, ...]
+
+function checkOcrRateLimit(key) {
+  const now = Date.now();
+  const timestamps = (ocrCallLog.get(key) || []).filter((t) => now - t < OCR_RATE_WINDOW_MS);
+  if (timestamps.length >= OCR_RATE_LIMIT) {
+    ocrCallLog.set(key, timestamps);
+    return false;
+  }
+  timestamps.push(now);
+  ocrCallLog.set(key, timestamps);
+  return true;
+}
+// ---- レート制限ここまで ----
+
 function buildPrompt(targetMonth) {
   return `この画像は手書きの出勤簿です。次のJSONオブジェクトのみを出力してください(説明文やコードブロック記号は不要、JSON以外の文字は一切出力しないこと)。
 
@@ -114,6 +132,11 @@ app.post("/api/ocr", async (req, res) => {
   try {
     if (!ANTHROPIC_API_KEY) {
       return res.status(500).json({ error: "サーバーにANTHROPIC_API_KEYが設定されていません。" });
+    }
+
+    const rateKey = parseCookies(req).session || req.ip;
+    if (!checkOcrRateLimit(rateKey)) {
+      return res.status(429).json({ error: `短時間に読み取りが集中しています。${Math.ceil(OCR_RATE_WINDOW_MS / 60000)}分ほど時間を置いてから再試行してください。` });
     }
 
     const { imageBase64, mimeType, isPdf, targetMonth } = req.body || {};
