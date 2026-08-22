@@ -139,19 +139,20 @@ function EmployeeTimesheet() {
   const [previewMode, setPreviewMode] = useState(false);
   const [employeeName, setEmployeeName] = useState(draft.employeeName || "");
   const [workplaceName, setWorkplaceName] = useState(draft.workplaceName || "");
+  const [creatorName, setCreatorName] = useState(draft.creatorName || "");
   const [autoName, setAutoName] = useState({ employeeName: false, workplaceName: false });
 
   React.useEffect(() => {
     const data = {
       startDate, numWeeks, unit, target, checkinDir, checkoutDir, genericDir, weeklyLimitH,
-      entries, periodMode, targetMonth, profiles, selectedProfileId, employeeName, workplaceName,
+      entries, periodMode, targetMonth, profiles, selectedProfileId, employeeName, workplaceName, creatorName,
     };
     try {
       window.localStorage.setItem(DRAFT_KEY, JSON.stringify(data));
     } catch (e) {
       // 容量オーバー等は無視(致命的ではない)
     }
-  }, [startDate, numWeeks, unit, target, checkinDir, checkoutDir, genericDir, weeklyLimitH, entries, periodMode, targetMonth, profiles, selectedProfileId, employeeName, workplaceName]);
+  }, [startDate, numWeeks, unit, target, checkinDir, checkoutDir, genericDir, weeklyLimitH, entries, periodMode, targetMonth, profiles, selectedProfileId, employeeName, workplaceName, creatorName]);
 
   function clearDraft() {
     if (!window.confirm("この端末に保存されている下書きを消去し、新しい入力を始めますか?")) return;
@@ -161,6 +162,7 @@ function EmployeeTimesheet() {
     setEntries({});
     setEmployeeName("");
     setWorkplaceName("");
+    setCreatorName("");
     setAttachments([]);
     setActiveAttachmentId(null);
   }
@@ -561,9 +563,28 @@ function EmployeeTimesheet() {
             <div style={{ display: "flex", gap: 24, marginTop: 8, fontSize: 13, color: "var(--ink)" }}>
               {employeeName && <div>氏名　<strong>{employeeName}</strong></div>}
               {workplaceName && <div>就業先　<strong>{workplaceName}</strong></div>}
+              {creatorName && <div>作成者　<strong>{creatorName}</strong></div>}
             </div>
           )}
         </div>
+
+        {employeeName && (
+          <div
+            className="no-print"
+            style={{
+              background: "#FDF3D9",
+              border: "1px solid #C9A227",
+              borderRadius: 8,
+              padding: "10px 16px",
+              marginBottom: 16,
+              fontSize: 13,
+              color: "#6B5210",
+              fontWeight: 600,
+            }}
+          >
+            現在「{employeeName}」さんのデータを編集しています。別の人の分を新しく始める前に、右上の「下書きを消去」を押してください。
+          </div>
+        )}
 
         <div className="no-print" style={{ background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 10, padding: "16px 24px", marginBottom: 20, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 16 }}>
           <div>
@@ -608,6 +629,16 @@ function EmployeeTimesheet() {
                 background: autoName.workplaceName ? "#FDF3D9" : undefined,
                 borderColor: autoName.workplaceName ? "#C9A227" : undefined,
               }}
+            />
+          </div>
+          <div>
+            <label style={{ fontSize: 12, color: "var(--ink-soft)", display: "block", marginBottom: 4 }}>作成者(担当者名)</label>
+            <input
+              type="text"
+              placeholder="例: 藤崎"
+              value={creatorName}
+              onChange={(e) => setCreatorName(e.target.value)}
+              style={{ border: "1px solid var(--line)", borderRadius: 6, padding: "7px 10px", fontSize: 14, width: "100%" }}
             />
           </div>
         </div>
