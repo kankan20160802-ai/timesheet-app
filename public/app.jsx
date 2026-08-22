@@ -97,20 +97,24 @@ function roundToUnit(minutes, unit, direction) {
   return Math.round(minutes / unit) * unit;
 }
 
-function EmployeeTimesheet({ employeeId, initial, profiles, setProfiles, onPersist, onBack }) {
-  const [startDate, setStartDate] = useState(initial.startDate || "2026-07-19");
-  const [numWeeks, setNumWeeks] = useState(initial.numWeeks || 4);
+function EmployeeTimesheet() {
+  const [startDate, setStartDate] = useState("2026-07-19");
+  const [numWeeks, setNumWeeks] = useState(4);
   const [unit, setUnit] = useState(15);
   const [target, setTarget] = useState("punch"); // punch | daily | weekly
   const [checkinDir, setCheckinDir] = useState("up");
   const [checkoutDir, setCheckoutDir] = useState("down");
   const [genericDir, setGenericDir] = useState("down");
   const [weeklyLimitH, setWeeklyLimitH] = useState(28);
-  const [entries, setEntries] = useState(initial.entries || {});
+  const [entries, setEntries] = useState({});
 
-  const [periodMode, setPeriodMode] = useState(initial.periodMode || "profile"); // 'profile' | 'manual'
-  const [targetMonth, setTargetMonth] = useState(initial.targetMonth || "2026-08");
-  const [selectedProfileId, setSelectedProfileId] = useState(initial.selectedProfileId || (profiles[0] && profiles[0].id) || "p1");
+  const [periodMode, setPeriodMode] = useState("profile"); // 'profile' | 'manual'
+  const [targetMonth, setTargetMonth] = useState("2026-08");
+  const [profiles, setProfiles] = useState([
+    { id: "p1", name: "会社A(20日締め)", closingDay: "20", unit: 5, target: "punch", checkinDir: "up", checkoutDir: "down", genericDir: "down", weeklyLimitH: 28 },
+    { id: "p2", name: "会社B(末日締め)", closingDay: "endOfMonth", unit: 15, target: "daily", checkinDir: "up", checkoutDir: "down", genericDir: "down", weeklyLimitH: 28 },
+  ]);
+  const [selectedProfileId, setSelectedProfileId] = useState("p1");
   const [newProfileName, setNewProfileName] = useState("");
   const [newProfileClosing, setNewProfileClosing] = useState("20");
   const [attachments, setAttachments] = useState([]);
@@ -118,26 +122,9 @@ function EmployeeTimesheet({ employeeId, initial, profiles, setProfiles, onPersi
   const [ocrStatus, setOcrStatus] = useState("idle"); // idle | loading | done | error
   const [ocrMessage, setOcrMessage] = useState("");
   const [previewMode, setPreviewMode] = useState(false);
-  const [employeeName, setEmployeeName] = useState(initial.name || "");
-  const [workplaceName, setWorkplaceName] = useState(initial.workplaceName || "");
-  const [visaExpiry, setVisaExpiry] = useState(initial.visaExpiry || "");
+  const [employeeName, setEmployeeName] = useState("");
+  const [workplaceName, setWorkplaceName] = useState("");
   const [autoName, setAutoName] = useState({ employeeName: false, workplaceName: false });
-
-  React.useEffect(() => {
-    onPersist(employeeId, {
-      name: employeeName,
-      workplaceName,
-      visaExpiry,
-      entries,
-      selectedProfileId,
-      targetMonth,
-      periodMode,
-      startDate,
-      numWeeks,
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [employeeName, workplaceName, visaExpiry, entries, selectedProfileId, targetMonth, periodMode, startDate, numWeeks]);
-
   function compressImage(dataUrl, maxDim = 1600, quality = 0.85) {
     return new Promise((resolve) => {
       const img = new Image();
@@ -256,7 +243,7 @@ function EmployeeTimesheet({ employeeId, initial, profiles, setProfiles, onPersi
   }
 
   function getEntry(dateStr) {
-    return entries[dateStr] || { checkin: "", breakStart: "", breakEnd: "", checkout: "", dispatch: "", auto: {} };
+    return entries[dateStr] || { checkin: "", breakStart: "", breakEnd: "", checkout: "", auto: {} };
   }
 
   const allPeriodDays = useMemo(() => weeks.flat(), [weeks]);
@@ -466,26 +453,8 @@ function EmployeeTimesheet({ employeeId, initial, profiles, setProfiles, onPersi
           borderBottom: "1px solid var(--line)",
         }}
       >
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <button
-            className="no-print"
-            onClick={onBack}
-            style={{
-              padding: "8px 14px",
-              borderRadius: 8,
-              fontSize: 13,
-              fontWeight: 600,
-              border: "1px solid var(--line)",
-              background: "#fff",
-              color: "var(--ink)",
-              cursor: "pointer",
-            }}
-          >
-            ← 従業員一覧に戻る
-          </button>
-          <div style={{ fontSize: 12, color: "var(--ink-soft)" }}>
-            {previewMode ? "PDF出力プレビュー中(実際に印刷される内容の見た目です)" : "編集モード"}
-          </div>
+        <div style={{ fontSize: 12, color: "var(--ink-soft)" }}>
+          {previewMode ? "PDF出力プレビュー中(実際に印刷される内容の見た目です)" : "編集モード"}
         </div>
         <div style={{ display: "flex", gap: 8 }}>
           <button
@@ -583,22 +552,6 @@ function EmployeeTimesheet({ employeeId, initial, profiles, setProfiles, onPersi
                 borderColor: autoName.workplaceName ? "#C9A227" : undefined,
               }}
             />
-          </div>
-          <div>
-            <label style={{ fontSize: 12, color: "var(--ink-soft)", display: "block", marginBottom: 4 }}>在留期限</label>
-            <input
-              type="date"
-              value={visaExpiry}
-              onChange={(e) => setVisaExpiry(e.target.value)}
-              style={{ border: "1px solid var(--line)", borderRadius: 6, padding: "7px 10px", fontSize: 14, width: "100%" }}
-            />
-            {visaExpiry &&
-              (() => {
-                const days = Math.ceil((new Date(visaExpiry + "T00:00:00") - new Date()) / 86400000);
-                if (days < 0) return <div style={{ fontSize: 12, color: "var(--warn)", marginTop: 4, fontWeight: 600 }}>期限切れ({-days}日超過)</div>;
-                if (days <= 30) return <div style={{ fontSize: 12, color: "var(--warn)", marginTop: 4, fontWeight: 600 }}>期限まで残り{days}日</div>;
-                return <div style={{ fontSize: 12, color: "var(--ink-soft)", marginTop: 4 }}>残り{days}日</div>;
-              })()}
           </div>
         </div>
 
@@ -1041,7 +994,7 @@ function EmployeeTimesheet({ employeeId, initial, profiles, setProfiles, onPersi
                 <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
                   <thead>
                     <tr style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>
-                      {["日付", "曜", "派遣先", "出社", "休憩開始", "休憩終了", "退社", "丸め後", "実働"].map((h) => (
+                      {["日付", "曜", "出社", "休憩開始", "休憩終了", "退社", "丸め後", "実働"].map((h) => (
                         <th key={h} style={{ padding: "8px 10px", textAlign: "center", fontWeight: 600, fontFamily: "var(--font-body)" }}>{h}</th>
                       ))}
                     </tr>
@@ -1056,16 +1009,6 @@ function EmployeeTimesheet({ employeeId, initial, profiles, setProfiles, onPersi
                         <tr key={dateStr} style={{ borderTop: "1px solid var(--line)" }}>
                           <td style={{ padding: "6px 10px", fontFamily: "var(--font-mono)", color: "var(--ink-soft)" }}>{dayNum}日</td>
                           <td style={{ padding: "6px 10px", textAlign: "center", color: dowColor, fontWeight: 600 }}>{DOW_LABEL[dow]}</td>
-                          <td style={{ padding: "6px 8px", textAlign: "center" }}>
-                            <input
-                              className="ts-input"
-                              placeholder={workplaceName || "(既定)"}
-                              value={e.dispatch}
-                              onChange={(ev) => updateEntry(dateStr, "dispatch", ev.target.value)}
-                              style={{ width: 92 }}
-                              title="この日だけ違う派遣先で働いた場合のみ入力(空欄なら就業先欄の値を使用)"
-                            />
-                          </td>
                           <td style={{ padding: "6px 8px", textAlign: "center" }}>
                             <input
                               className="ts-input"
@@ -1156,219 +1099,5 @@ function EmployeeTimesheet({ employeeId, initial, profiles, setProfiles, onPersi
   );
 }
 
-const EMP_STORAGE_KEY = "timesheet_employees_v1";
-const PROFILE_STORAGE_KEY = "timesheet_profiles_v1";
-
-function loadFromStorage(key, fallback) {
-  try {
-    const raw = window.localStorage.getItem(key);
-    if (!raw) return fallback;
-    return JSON.parse(raw);
-  } catch (e) {
-    return fallback;
-  }
-}
-
-function saveToStorage(key, value) {
-  try {
-    window.localStorage.setItem(key, JSON.stringify(value));
-  } catch (e) {
-    // ストレージ容量オーバー等は静かに無視(致命的ではない)
-  }
-}
-
-function visaStatus(visaExpiry) {
-  if (!visaExpiry) return null;
-  const days = Math.ceil((new Date(visaExpiry + "T00:00:00") - new Date()) / 86400000);
-  if (days < 0) return { level: "danger", label: `期限切れ(${-days}日超過)`, days };
-  if (days <= 30) return { level: "warn", label: `期限まで残り${days}日`, days };
-  return { level: "ok", label: `残り${days}日`, days };
-}
-
-function hasDispatchOverlap(employee) {
-  const entries = employee.entries || {};
-  const byWeek = {};
-  Object.keys(entries).forEach((dateStr) => {
-    const e = entries[dateStr];
-    if (!e || !e.checkin) return; // 実際に出勤した日のみ対象
-    const d = new Date(dateStr + "T00:00:00");
-    const sunday = new Date(d);
-    sunday.setDate(sunday.getDate() - d.getDay());
-    const weekKey = toDateStr(sunday);
-    const label = (e.dispatch && e.dispatch.trim()) || employee.workplaceName || "(未設定)";
-    if (!byWeek[weekKey]) byWeek[weekKey] = new Set();
-    byWeek[weekKey].add(label);
-  });
-  return Object.values(byWeek).some((set) => set.size > 1);
-}
-
-function EmployeeList({ employees, onSelect, onAdd, onDelete }) {
-  const [newName, setNewName] = useState("");
-
-  const rows = employees.map((emp) => {
-    const visa = visaStatus(emp.visaExpiry);
-    const overlap = hasDispatchOverlap(emp);
-    let priority = 2;
-    if (visa && visa.level === "danger") priority = 0;
-    else if (visa && visa.level === "warn") priority = 0;
-    else if (overlap) priority = 1;
-    return { emp, visa, overlap, priority };
-  });
-
-  rows.sort((a, b) => {
-    if (a.priority !== b.priority) return a.priority - b.priority;
-    if (a.priority === 0) return (a.visa.days || 0) - (b.visa.days || 0);
-    return (a.emp.name || "").localeCompare(b.emp.name || "", "ja");
-  });
-
-  return (
-    <div style={{ background: "var(--bg)", minHeight: "100%", fontFamily: "var(--font-body)" }}>
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Zilla+Slab:wght@500;600;700&family=Noto+Sans+JP:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
-        :root {
-          --bg: #F4F2EC; --surface: #FFFFFF; --ink: #24302A; --ink-soft: #5B6660;
-          --line: #DAD4C4; --accent: #2F5D50; --accent-soft: #E4ECE7;
-          --warn: #A6432A; --warn-soft: #F3E1DA;
-          --font-display: 'Zilla Slab', serif; --font-body: 'Noto Sans JP', sans-serif; --font-mono: 'IBM Plex Mono', monospace;
-        }
-      `}</style>
-      <div style={{ maxWidth: 900, margin: "0 auto", padding: "40px 24px 64px" }}>
-        <div style={{ marginBottom: 24 }}>
-          <div style={{ fontFamily: "var(--font-mono)", fontSize: 12, letterSpacing: "0.08em", color: "var(--accent)", marginBottom: 6 }}>
-            EMPLOYEE LIST — {employees.length}名登録
-          </div>
-          <h1 style={{ fontFamily: "var(--font-display)", fontSize: 28, fontWeight: 700, color: "var(--ink)", margin: 0 }}>
-            従業員一覧
-          </h1>
-          <p style={{ color: "var(--ink-soft)", fontSize: 13, marginTop: 6, lineHeight: 1.6 }}>
-            在留期限が近い人・複数派遣先での勤務が重なっている人を上に表示しています。
-          </p>
-        </div>
-
-        <div style={{ display: "flex", gap: 8, marginBottom: 20 }}>
-          <input
-            type="text"
-            placeholder="新しい従業員の氏名を入力して追加"
-            value={newName}
-            onChange={(e) => setNewName(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && newName.trim()) {
-                onAdd(newName.trim());
-                setNewName("");
-              }
-            }}
-            style={{ flex: 1, border: "1px solid var(--line)", borderRadius: 8, padding: "10px 12px", fontSize: 14 }}
-          />
-          <button
-            onClick={() => {
-              if (newName.trim()) {
-                onAdd(newName.trim());
-                setNewName("");
-              }
-            }}
-            style={{ padding: "10px 18px", borderRadius: 8, fontSize: 13, fontWeight: 600, border: "1px solid var(--accent)", background: "var(--accent)", color: "#fff", cursor: "pointer" }}
-          >
-            追加
-          </button>
-        </div>
-
-        <div style={{ background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 10, overflow: "hidden" }}>
-          {rows.length === 0 && (
-            <div style={{ padding: 24, textAlign: "center", color: "var(--ink-soft)", fontSize: 13 }}>
-              まだ従業員が登録されていません。
-            </div>
-          )}
-          {rows.map(({ emp, visa, overlap, priority }, idx) => (
-            <div
-              key={emp.id}
-              onClick={() => onSelect(emp.id)}
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                alignItems: "center",
-                padding: "14px 20px",
-                borderTop: idx === 0 ? "none" : "1px solid var(--line)",
-                cursor: "pointer",
-                background: priority === 0 ? "var(--warn-soft)" : priority === 1 ? "#FDF3D9" : "transparent",
-              }}
-            >
-              <div>
-                <div style={{ fontWeight: 600, color: "var(--ink)", fontSize: 15 }}>{emp.name || "(氏名未入力)"}</div>
-                <div style={{ fontSize: 12, color: "var(--ink-soft)", marginTop: 2 }}>
-                  {emp.workplaceName || "就業先未設定"}
-                </div>
-              </div>
-              <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-                {visa && (visa.level === "danger" || visa.level === "warn") && (
-                  <span style={{ fontSize: 12, fontWeight: 700, color: "var(--warn)" }}>在留 {visa.label}</span>
-                )}
-                {overlap && (
-                  <span style={{ fontSize: 12, fontWeight: 700, color: "#8A6D1D" }}>複数派遣先あり</span>
-                )}
-                <button
-                  onClick={(ev) => {
-                    ev.stopPropagation();
-                    if (window.confirm(`${emp.name || "この従業員"}のデータを削除しますか?`)) onDelete(emp.id);
-                  }}
-                  style={{ border: "none", background: "transparent", color: "var(--ink-soft)", fontSize: 16, cursor: "pointer", padding: "0 4px" }}
-                  title="削除"
-                >
-                  ×
-                </button>
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function App() {
-  const [employees, setEmployees] = useState(() => loadFromStorage(EMP_STORAGE_KEY, []));
-  const [profiles, setProfiles] = useState(() =>
-    loadFromStorage(PROFILE_STORAGE_KEY, [
-      { id: "p1", name: "会社A(20日締め)", closingDay: "20", unit: 5, target: "punch", checkinDir: "up", checkoutDir: "down", genericDir: "down", weeklyLimitH: 28 },
-      { id: "p2", name: "会社B(末日締め)", closingDay: "endOfMonth", unit: 15, target: "daily", checkinDir: "up", checkoutDir: "down", genericDir: "down", weeklyLimitH: 28 },
-    ])
-  );
-  const [selectedId, setSelectedId] = useState(null);
-
-  React.useEffect(() => saveToStorage(EMP_STORAGE_KEY, employees), [employees]);
-  React.useEffect(() => saveToStorage(PROFILE_STORAGE_KEY, profiles), [profiles]);
-
-  function handleAdd(name) {
-    const id = `e${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    setEmployees((prev) => [...prev, { id, name, workplaceName: "", visaExpiry: "", entries: {} }]);
-    setSelectedId(id);
-  }
-
-  function handleDelete(id) {
-    setEmployees((prev) => prev.filter((e) => e.id !== id));
-  }
-
-  function handlePersist(id, patch) {
-    setEmployees((prev) => prev.map((e) => (e.id === id ? { ...e, ...patch } : e)));
-  }
-
-  const selected = employees.find((e) => e.id === selectedId);
-
-  if (selected) {
-    return (
-      <EmployeeTimesheet
-        key={selected.id}
-        employeeId={selected.id}
-        initial={selected}
-        profiles={profiles}
-        setProfiles={setProfiles}
-        onPersist={handlePersist}
-        onBack={() => setSelectedId(null)}
-      />
-    );
-  }
-
-  return <EmployeeList employees={employees} onSelect={setSelectedId} onAdd={handleAdd} onDelete={handleDelete} />;
-}
-
 const rootEl = document.getElementById("root");
-ReactDOM.createRoot(rootEl).render(<App />);
+ReactDOM.createRoot(rootEl).render(<EmployeeTimesheet />);
