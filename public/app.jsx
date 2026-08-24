@@ -64,14 +64,42 @@ function buildWeeksFromRange(startStr, endStr) {
   return order.map((k) => groups.get(k));
 }
 
+function normalizeTimeInput(str) {
+  if (!str) return "";
+  return String(str)
+    // 全角数字を半角に
+    .replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0))
+    // 全角コロン・句点・ピリオド・中黒などを半角コロンに寄せる
+    .replace(/[：；;]/g, ":")
+    .replace(/[．。・.]/g, ":")
+    .replace(/[　\s]/g, "")
+    .trim();
+}
+
 function parseTimeToMinutes(str) {
-  if (!str) return null;
-  const m = /^(\d{1,2}):(\d{2})$/.exec(str.trim());
+  const s = normalizeTimeInput(str);
+  if (!s) return null;
+  // 分は必ず2桁(「13:5」が 13:05 か 13:50 か判別できないため、あえて弾く)
+  const m = /^(\d{1,2}):(\d{2})$/.exec(s);
   if (!m) return null;
   const h = parseInt(m[1], 10);
   const mm = parseInt(m[2], 10);
-  if (isNaN(h) || isNaN(mm) || mm > 59) return null;
+  if (isNaN(h) || isNaN(mm)) return null;
+  if (h > 23 || mm > 59) return null;
   return h * 60 + mm;
+}
+
+// 入力欄が「埋まっているのに時刻として解釈できない」場合を検出する
+function isInvalidTimeInput(str) {
+  if (!str || !String(str).trim()) return false; // 空欄は不正ではない
+  return parseTimeToMinutes(str) === null;
+}
+
+// 不正入力は赤、AI読み取り未確認は黄、それ以外は既定のスタイル
+function timeInputStyle(value, isAuto) {
+  if (isInvalidTimeInput(value)) return { background: "#F9E2DC", borderColor: "#A6432A", color: "#A6432A" };
+  if (isAuto) return { background: "#FDF3D9", borderColor: "#C9A227" };
+  return undefined;
 }
 
 function formatClock(minutes) {
@@ -98,6 +126,7 @@ function roundToUnit(minutes, unit, direction) {
 }
 
 const DRAFT_KEY = "timesheet_draft_v1";
+const ATTACH_KEY = "timesheet_attachments_v1";
 
 function loadDraft() {
   try {
@@ -132,8 +161,16 @@ function EmployeeTimesheet() {
   const [selectedProfileId, setSelectedProfileId] = useState(draft.selectedProfileId || "p1");
   const [newProfileName, setNewProfileName] = useState("");
   const [newProfileClosing, setNewProfileClosing] = useState("20");
-  const [attachments, setAttachments] = useState([]);
+  const [attachments, setAttachments] = useState(() => {
+    try {
+      const raw = window.localStorage.getItem(ATTACH_KEY);
+      return raw ? JSON.parse(raw) : [];
+    } catch (e) {
+      return [];
+    }
+  });
   const [activeAttachmentId, setActiveAttachmentId] = useState(null);
+  const [attachWarning, setAttachWarning] = useState("");
   const [ocrStatus, setOcrStatus] = useState("idle"); // idle | loading | done | error
   const [ocrMessage, setOcrMessage] = useState("");
   const [previewMode, setPreviewMode] = useState(false);
@@ -155,10 +192,29 @@ function EmployeeTimesheet() {
     }
   }, [startDate, numWeeks, unit, target, checkinDir, checkoutDir, genericDir, weeklyLimitH, entries, periodMode, targetMonth, profiles, selectedProfileId, employeeName, workplaceName, creatorName, priorEntries]);
 
+  // 添付画像はサイズが大きいため別キーに保存し、容量オーバー時は保存だけ諦める
+  React.useEffect(() => {
+    try {
+      window.localStorage.setItem(ATTACH_KEY, JSON.stringify(attachments));
+      setAttachWarning("");
+    } catch (e) {
+      setAttachWarning("添付画像が大きすぎるため、この端末に保存できませんでした(ページを再読み込みすると画像は消えます)。入力済みの時刻データは保存されています。");
+    }
+  }, [attachments]);
+
+  // 復元した添付があれば最初の1枚を選択状態にする
+  React.useEffect(() => {
+    if (!activeAttachmentId && attachments.length > 0) {
+      setActiveAttachmentId(attachments[0].id);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   function clearDraft() {
     if (!window.confirm("この端末に保存されている下書きを消去し、新しい入力を始めますか?")) return;
     try {
       window.localStorage.removeItem(DRAFT_KEY);
+      window.localStorage.removeItem(ATTACH_KEY);
     } catch (e) {}
     setEntries({});
     setPriorEntries({});
@@ -310,9 +366,18 @@ function EmployeeTimesheet() {
 
   const allPeriodDays = useMemo(() => weeks.flat(), [weeks]);
 
-  function findDateStrForDay(day) {
-    const match = allPeriodDays.find((d) => parseInt(d.dateStr.split("-")[2], 10) === day);
-    return match ? match.dateStr : null;
+  // 期間が32日以上に及ぶと同じ「日」番号が2回現れるため、
+  // すでに割り当てた日付は再利用しないよう、前から順に消費して照合する。
+  function makeDayResolver() {
+    const used = new Set();
+    return function resolve(day) {
+      const match = allPeriodDays.find(
+        (d) => parseInt(d.dateStr.split("-")[2], 10) === day && !used.has(d.dateStr)
+      );
+      if (!match) return null;
+      used.add(match.dateStr);
+      return match.dateStr;
+    };
   }
 
   async function runOcrForActiveAttachment() {
@@ -353,10 +418,11 @@ function EmployeeTimesheet() {
       }
 
       let filledCount = 0;
+      const resolveDay = makeDayResolver();
       setEntries((prev) => {
         const next = { ...prev };
         rows.forEach((r) => {
-          const dateStr = findDateStrForDay(r.day);
+          const dateStr = resolveDay(r.day);
           if (!dateStr) return;
           const cur = next[dateStr] || { checkin: "", breakStart: "", breakEnd: "", checkout: "", auto: {} };
           const updated = { ...cur, auto: { ...(cur.auto || {}) } };
@@ -460,6 +526,19 @@ function EmployeeTimesheet() {
   }, [allPeriodDays, entries, priorEntries, unit, target, checkinDir, checkoutDir, genericDir, weeklyLimitH]);
 
   const rollingViolations = rollingChecks.filter((r) => r.over);
+
+  // 時刻として認識できない入力を検出(集計から静かに漏れるのを防ぐ)
+  const invalidInputs = useMemo(() => {
+    const out = [];
+    const check = (dateStr, entry, label) => {
+      ["checkin", "breakStart", "breakEnd", "checkout"].forEach((f) => {
+        if (isInvalidTimeInput(entry[f])) out.push({ dateStr, field: f, value: entry[f], label });
+      });
+    };
+    allPeriodDays.forEach(({ dateStr }) => check(dateStr, entries[dateStr] || {}, "期間内"));
+    Object.keys(priorEntries).forEach((dateStr) => check(dateStr, priorEntries[dateStr] || {}, "参考"));
+    return out;
+  }, [allPeriodDays, entries, priorEntries]);
 
   return (
     <div style={{ background: "var(--bg)", minHeight: "100%", fontFamily: "var(--font-body)" }}>
@@ -627,6 +706,34 @@ function EmployeeTimesheet() {
           </div>
         )}
 
+        {invalidInputs.length > 0 && (
+          <div
+            className="no-print"
+            style={{
+              background: "var(--warn-soft)",
+              border: "1px solid var(--warn)",
+              borderRadius: 8,
+              padding: "10px 16px",
+              marginBottom: 16,
+              fontSize: 13,
+              color: "var(--warn)",
+              lineHeight: 1.7,
+            }}
+          >
+            <strong>時刻として認識できない入力が {invalidInputs.length} 件あります(赤い欄)。</strong>
+            <br />
+            このままでは集計に含まれません。全角の「：」や打ち間違いがないか確認してください(正しい例: 13:17)。
+            <div style={{ marginTop: 6, fontFamily: "var(--font-mono)", fontSize: 12 }}>
+              {invalidInputs.slice(0, 8).map((v, i) => (
+                <span key={i} style={{ marginRight: 12 }}>
+                  {v.dateStr}「{v.value}」
+                </span>
+              ))}
+              {invalidInputs.length > 8 && <span>ほか{invalidInputs.length - 8}件</span>}
+            </div>
+          </div>
+        )}
+
         <div className="no-print" style={{ background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 10, padding: "16px 24px", marginBottom: 20, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 16 }}>
           <div>
             <label style={{ fontSize: 12, color: "var(--ink-soft)", display: "block", marginBottom: 4 }}>氏名</label>
@@ -723,6 +830,12 @@ function EmployeeTimesheet() {
               <input type="file" accept="image/*,application/pdf" multiple onChange={handleFilesSelected} style={{ display: "none" }} />
             </label>
           </div>
+
+          {attachWarning && (
+            <div style={{ fontSize: 12, color: "var(--warn)", background: "var(--warn-soft)", border: "1px solid var(--warn)", borderRadius: 6, padding: "8px 12px", marginBottom: 12, lineHeight: 1.6 }}>
+              {attachWarning}
+            </div>
+          )}
 
           {attachments.length > 0 && (
             <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: activeAttachment ? 14 : 0 }}>
@@ -994,16 +1107,16 @@ function EmployeeTimesheet() {
                     <tr key={dateStr} style={{ borderTop: "1px solid var(--line)" }}>
                       <td style={{ padding: "6px 10px", fontFamily: "var(--font-mono)", color: "var(--ink-soft)", textAlign: "center" }}>{dateStr}</td>
                       <td style={{ padding: "6px 8px", textAlign: "center" }}>
-                        <input className="ts-input" placeholder="—" value={pe.checkin || ""} onChange={(ev) => updatePriorEntry(dateStr, "checkin", ev.target.value)} />
+                        <input className="ts-input" placeholder="—" value={pe.checkin || ""} onChange={(ev) => updatePriorEntry(dateStr, "checkin", ev.target.value)} style={timeInputStyle(pe.checkin)} />
                       </td>
                       <td style={{ padding: "6px 8px", textAlign: "center" }}>
-                        <input className="ts-input" placeholder="—" value={pe.breakStart || ""} onChange={(ev) => updatePriorEntry(dateStr, "breakStart", ev.target.value)} />
+                        <input className="ts-input" placeholder="—" value={pe.breakStart || ""} onChange={(ev) => updatePriorEntry(dateStr, "breakStart", ev.target.value)} style={timeInputStyle(pe.breakStart)} />
                       </td>
                       <td style={{ padding: "6px 8px", textAlign: "center" }}>
-                        <input className="ts-input" placeholder="—" value={pe.breakEnd || ""} onChange={(ev) => updatePriorEntry(dateStr, "breakEnd", ev.target.value)} />
+                        <input className="ts-input" placeholder="—" value={pe.breakEnd || ""} onChange={(ev) => updatePriorEntry(dateStr, "breakEnd", ev.target.value)} style={timeInputStyle(pe.breakEnd)} />
                       </td>
                       <td style={{ padding: "6px 8px", textAlign: "center" }}>
-                        <input className="ts-input" placeholder="—" value={pe.checkout || ""} onChange={(ev) => updatePriorEntry(dateStr, "checkout", ev.target.value)} />
+                        <input className="ts-input" placeholder="—" value={pe.checkout || ""} onChange={(ev) => updatePriorEntry(dateStr, "checkout", ev.target.value)} style={timeInputStyle(pe.checkout)} />
                       </td>
                     </tr>
                   );
@@ -1228,7 +1341,8 @@ function EmployeeTimesheet() {
                               value={e.checkin}
                               onChange={(ev) => updateEntry(dateStr, "checkin", ev.target.value)}
                               onClick={() => confirmAutoField(dateStr, "checkin")}
-                              style={e.auto && e.auto.checkin ? { background: "#FDF3D9", borderColor: "#C9A227" } : undefined}
+                              title={isInvalidTimeInput(e.checkin) ? "時刻として認識できません(例: 13:17)" : undefined}
+                              style={timeInputStyle(e.checkin, e.auto && e.auto.checkin)}
                             />
                           </td>
                           <td style={{ padding: "6px 8px", textAlign: "center" }}>
@@ -1238,7 +1352,8 @@ function EmployeeTimesheet() {
                               value={e.breakStart}
                               onChange={(ev) => updateEntry(dateStr, "breakStart", ev.target.value)}
                               onClick={() => confirmAutoField(dateStr, "breakStart")}
-                              style={e.auto && e.auto.breakStart ? { background: "#FDF3D9", borderColor: "#C9A227" } : undefined}
+                              title={isInvalidTimeInput(e.breakStart) ? "時刻として認識できません(例: 12:00)" : undefined}
+                              style={timeInputStyle(e.breakStart, e.auto && e.auto.breakStart)}
                             />
                           </td>
                           <td style={{ padding: "6px 8px", textAlign: "center" }}>
@@ -1248,7 +1363,8 @@ function EmployeeTimesheet() {
                               value={e.breakEnd}
                               onChange={(ev) => updateEntry(dateStr, "breakEnd", ev.target.value)}
                               onClick={() => confirmAutoField(dateStr, "breakEnd")}
-                              style={e.auto && e.auto.breakEnd ? { background: "#FDF3D9", borderColor: "#C9A227" } : undefined}
+                              title={isInvalidTimeInput(e.breakEnd) ? "時刻として認識できません(例: 13:00)" : undefined}
+                              style={timeInputStyle(e.breakEnd, e.auto && e.auto.breakEnd)}
                             />
                           </td>
                           <td style={{ padding: "6px 8px", textAlign: "center" }}>
@@ -1258,7 +1374,8 @@ function EmployeeTimesheet() {
                               value={e.checkout}
                               onChange={(ev) => updateEntry(dateStr, "checkout", ev.target.value)}
                               onClick={() => confirmAutoField(dateStr, "checkout")}
-                              style={e.auto && e.auto.checkout ? { background: "#FDF3D9", borderColor: "#C9A227" } : undefined}
+                              title={isInvalidTimeInput(e.checkout) ? "時刻として認識できません(例: 18:30)" : undefined}
+                              style={timeInputStyle(e.checkout, e.auto && e.auto.checkout)}
                             />
                           </td>
                           <td style={{ padding: "6px 10px", textAlign: "center", fontFamily: "var(--font-mono)", color: "var(--ink-soft)" }}>
