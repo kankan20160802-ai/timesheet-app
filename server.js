@@ -11,8 +11,30 @@ const APP_PASSWORD = process.env.APP_PASSWORD;
 const MODEL = "claude-sonnet-4-6";
 
 // ---- 簡易認証(共通パスワード + 3時間セッション) ----
+// セッションはサーバーのメモリに持たず、署名付きトークンで表現する。
+// これにより Render の無料プランがスリープ・再起動しても全員ログアウトにならない。
 const SESSION_DURATION_MS = 3 * 60 * 60 * 1000; // 3時間
-const sessions = new Map(); // token -> expiresAt
+const SESSION_SECRET = process.env.SESSION_SECRET || (APP_PASSWORD ? `derived:${APP_PASSWORD}` : "dev-secret");
+
+function signSession(expiresAt) {
+  const payload = String(expiresAt);
+  const sig = crypto.createHmac("sha256", SESSION_SECRET).update(payload).digest("hex");
+  return `${payload}.${sig}`;
+}
+
+function verifySession(token) {
+  if (!token || typeof token !== "string") return false;
+  const idx = token.lastIndexOf(".");
+  if (idx === -1) return false;
+  const payload = token.slice(0, idx);
+  const sig = token.slice(idx + 1);
+  const expected = crypto.createHmac("sha256", SESSION_SECRET).update(payload).digest("hex");
+  const a = Buffer.from(sig);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return false;
+  const expiresAt = Number(payload);
+  return Number.isFinite(expiresAt) && expiresAt > Date.now();
+}
 
 function parseCookies(req) {
   const header = req.headers.cookie;
@@ -30,14 +52,7 @@ function parseCookies(req) {
 
 function isAuthenticated(req) {
   if (!APP_PASSWORD) return true; // パスワード未設定時は認証をスキップ(開発用)
-  const token = parseCookies(req).session;
-  if (!token) return false;
-  const expiresAt = sessions.get(token);
-  if (!expiresAt || expiresAt < Date.now()) {
-    sessions.delete(token);
-    return false;
-  }
-  return true;
+  return verifySession(parseCookies(req).session);
 }
 
 const LOGIN_PAGE = `<!DOCTYPE html>
@@ -73,15 +88,12 @@ app.post("/login", (req, res) => {
   if (!APP_PASSWORD || password !== APP_PASSWORD) {
     return res.status(401).json({ error: "パスワードが違います" });
   }
-  const token = crypto.randomBytes(24).toString("hex");
-  sessions.set(token, Date.now() + SESSION_DURATION_MS);
+  const token = signSession(Date.now() + SESSION_DURATION_MS);
   res.setHeader("Set-Cookie", `session=${token}; HttpOnly; Path=/; Max-Age=${Math.floor(SESSION_DURATION_MS / 1000)}; SameSite=Lax`);
   res.json({ ok: true });
 });
 
 app.post("/logout", (req, res) => {
-  const token = parseCookies(req).session;
-  if (token) sessions.delete(token);
   res.setHeader("Set-Cookie", "session=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax");
   res.json({ ok: true });
 });
@@ -112,6 +124,16 @@ function checkOcrRateLimit(key) {
   ocrCallLog.set(key, timestamps);
   return true;
 }
+
+// 古いエントリが溜まり続けないよう定期的に掃除する
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, times] of ocrCallLog) {
+    const kept = times.filter((t) => now - t < OCR_RATE_WINDOW_MS);
+    if (kept.length === 0) ocrCallLog.delete(key);
+    else ocrCallLog.set(key, kept);
+  }
+}, OCR_RATE_WINDOW_MS).unref();
 // ---- レート制限ここまで ----
 
 function buildPrompt(targetMonth) {
