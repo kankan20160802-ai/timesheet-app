@@ -172,6 +172,7 @@ function EmployeeTimesheet() {
   const [activeAttachmentId, setActiveAttachmentId] = useState(null);
   const [attachWarning, setAttachWarning] = useState("");
   const [ocrStatus, setOcrStatus] = useState("idle"); // idle | loading | done | error
+  const [ocrProvider, setOcrProvider] = useState(draft.ocrProvider || "anthropic"); // anthropic | google
   const [ocrMessage, setOcrMessage] = useState("");
   const [previewMode, setPreviewMode] = useState(false);
   const [employeeName, setEmployeeName] = useState(draft.employeeName || "");
@@ -183,14 +184,14 @@ function EmployeeTimesheet() {
   React.useEffect(() => {
     const data = {
       startDate, numWeeks, unit, target, checkinDir, checkoutDir, genericDir, weeklyLimitH,
-      entries, periodMode, targetMonth, profiles, selectedProfileId, employeeName, workplaceName, creatorName, priorEntries,
+      entries, periodMode, targetMonth, profiles, selectedProfileId, employeeName, workplaceName, creatorName, priorEntries, ocrProvider,
     };
     try {
       window.localStorage.setItem(DRAFT_KEY, JSON.stringify(data));
     } catch (e) {
       // 容量オーバー等は無視(致命的ではない)
     }
-  }, [startDate, numWeeks, unit, target, checkinDir, checkoutDir, genericDir, weeklyLimitH, entries, periodMode, targetMonth, profiles, selectedProfileId, employeeName, workplaceName, creatorName, priorEntries]);
+  }, [startDate, numWeeks, unit, target, checkinDir, checkoutDir, genericDir, weeklyLimitH, entries, periodMode, targetMonth, profiles, selectedProfileId, employeeName, workplaceName, creatorName, priorEntries, ocrProvider]);
 
   // 添付画像はサイズが大きいため別キーに保存し、容量オーバー時は保存だけ諦める
   React.useEffect(() => {
@@ -395,6 +396,7 @@ function EmployeeTimesheet() {
           mimeType: activeAttachment.mimeType || "image/jpeg",
           isPdf: !!activeAttachment.isPdf,
           targetMonth,
+          provider: ocrProvider,
         }),
       });
 
@@ -439,7 +441,11 @@ function EmployeeTimesheet() {
         return next;
       });
       setOcrStatus("done");
-      setOcrMessage(`${rows.length}日分を読み取り、${filledCount}件のマスに自動反映しました。黄色い欄は必ず原本と照合して確認してください。`);
+      const providerLabel = parsed.provider === "google" ? "Google Vision" : "Anthropic";
+      setOcrMessage(
+        `[${providerLabel}] ${rows.length}日分を読み取り、${filledCount}件のマスに自動反映しました。黄色い欄は必ず原本と照合して確認してください。` +
+          (parsed.note ? ` ${parsed.note}` : "")
+      );
     } catch (err) {
       setOcrStatus("error");
       const isNetworkErr = err instanceof TypeError || (err && /fetch/i.test(err.message || ""));
@@ -903,6 +909,29 @@ function EmployeeTimesheet() {
                 textAlign: "center",
               }}
             >
+              <div style={{ display: "flex", justifyContent: "center", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+                <span style={{ fontSize: 12, color: "var(--ink-soft)" }}>読み取り方式</span>
+                {[
+                  { v: "anthropic", l: "Anthropic" },
+                  { v: "google", l: "Google Vision" },
+                ].map((opt) => (
+                  <button
+                    key={opt.v}
+                    onClick={() => setOcrProvider(opt.v)}
+                    style={{
+                      padding: "5px 12px",
+                      borderRadius: 999,
+                      fontSize: 12,
+                      border: `1px solid ${ocrProvider === opt.v ? "var(--accent)" : "var(--line)"}`,
+                      background: ocrProvider === opt.v ? "var(--accent-soft)" : "#fff",
+                      color: ocrProvider === opt.v ? "var(--accent)" : "var(--ink-soft)",
+                      cursor: "pointer",
+                    }}
+                  >
+                    {opt.l}
+                  </button>
+                ))}
+              </div>
               <div style={{ display: "flex", justifyContent: "center", marginBottom: 10 }}>
                 <button
                   onClick={runOcrForActiveAttachment}
