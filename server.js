@@ -8,6 +8,7 @@ app.use(express.json({ limit: "20mb" }));
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const APP_PASSWORD = process.env.APP_PASSWORD;
+const GOOGLE_VISION_API_KEY = process.env.GOOGLE_VISION_API_KEY;
 const MODEL = "claude-sonnet-4-6";
 
 // ---- 簡易認証(共通パスワード + 3時間セッション) ----
@@ -136,8 +137,7 @@ setInterval(() => {
 }, OCR_RATE_WINDOW_MS).unref();
 // ---- レート制限ここまで ----
 
-function buildPrompt(targetMonth) {
-  return `この画像は手書きの出勤簿です。次のJSONオブジェクトのみを出力してください(説明文やコードブロック記号は不要、JSON以外の文字は一切出力しないこと)。
+function buildPrompt(targetMonth) {  return `この画像は手書きの出勤簿です。次のJSONオブジェクトのみを出力してください(説明文やコードブロック記号は不要、JSON以外の文字は一切出力しないこと)。
 
 {"employeeName": "氏名欄の内容", "workplaceName": "就業先・就業事業所名欄の内容", "rows": [{"day": 21, "checkin": "13:17", "breakStart": "", "breakEnd": "", "checkout": "18:30"}]}
 
@@ -150,67 +150,196 @@ function buildPrompt(targetMonth) {
 - 出力はJSONオブジェクトのみとし、前後に説明文やマークダウンのコードブロックを付けないこと。`;
 }
 
-app.post("/api/ocr", async (req, res) => {
+// ---- Anthropic による読み取り ----
+async function runAnthropicOcr({ imageBase64, mimeType, isPdf, targetMonth }) {
+  if (!ANTHROPIC_API_KEY) {
+    return { status: 500, body: { error: "サーバーにANTHROPIC_API_KEYが設定されていません。" } };
+  }
+
+  const contentBlock = isPdf
+    ? { type: "document", source: { type: "base64", media_type: "application/pdf", data: imageBase64 } }
+    : { type: "image", source: { type: "base64", media_type: mimeType || "image/jpeg", data: imageBase64 } };
+
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      max_tokens: 4096,
+      messages: [{ role: "user", content: [contentBlock, { type: "text", text: buildPrompt(targetMonth || "") }] }],
+    }),
+  });
+
+  const data = await response.json();
+
+  if (!response.ok || data.type === "error") {
+    const msg = (data.error && data.error.message) || `Anthropic API HTTP ${response.status}`;
+    return { status: 502, body: { error: msg } };
+  }
+
+  const text = (data.content || []).map((b) => b.text || "").join("\n");
+  const jsonStart = text.indexOf("{");
+  const jsonEnd = text.lastIndexOf("}");
+  if (jsonStart === -1 || jsonEnd === -1) {
+    return { status: 502, body: { error: "AIの応答からJSONを検出できませんでした。" } };
+  }
+
   try {
-    if (!ANTHROPIC_API_KEY) {
-      return res.status(500).json({ error: "サーバーにANTHROPIC_API_KEYが設定されていません。" });
+    const parsed = JSON.parse(text.slice(jsonStart, jsonEnd + 1));
+    return { status: 200, body: { ...parsed, provider: "anthropic" } };
+  } catch (e) {
+    return { status: 502, body: { error: "AIの応答を解析できませんでした(出力が途中で切れた可能性があります)。" } };
+  }
+}
+
+// ---- Google Cloud Vision による読み取り ----
+// Vision は「文字と座標」しか返さないため、行ごとにまとめて時刻を拾う処理を自前で行う。
+function groupTokensIntoRows(tokens) {
+  if (tokens.length === 0) return [];
+  const heights = tokens.map((t) => t.height).sort((a, b) => a - b);
+  const medianHeight = heights[Math.floor(heights.length / 2)] || 10;
+  const tolerance = medianHeight * 0.6;
+
+  const sorted = [...tokens].sort((a, b) => a.yCenter - b.yCenter);
+  const rows = [];
+  let current = [sorted[0]];
+
+  for (let i = 1; i < sorted.length; i++) {
+    const prevY = current[current.length - 1].yCenter;
+    if (Math.abs(sorted[i].yCenter - prevY) <= tolerance) {
+      current.push(sorted[i]);
+    } else {
+      rows.push(current);
+      current = [sorted[i]];
+    }
+  }
+  rows.push(current);
+  return rows.map((r) => r.sort((a, b) => a.xCenter - b.xCenter));
+}
+
+function extractRowsFromVision(annotations) {
+  const tokens = annotations.slice(1).map((a) => {
+    const xs = a.boundingPoly.vertices.map((v) => v.x || 0);
+    const ys = a.boundingPoly.vertices.map((v) => v.y || 0);
+    return {
+      text: a.description,
+      xCenter: (Math.min(...xs) + Math.max(...xs)) / 2,
+      yCenter: (Math.min(...ys) + Math.max(...ys)) / 2,
+      height: Math.max(...ys) - Math.min(...ys),
+    };
+  });
+
+  const rows = groupTokensIntoRows(tokens);
+  const out = [];
+
+  rows.forEach((rowTokens) => {
+    const joined = rowTokens.map((t) => t.text).join("");
+    // 行頭の数字を日付とみなす
+    const dayMatch = /^(\d{1,2})/.exec(joined);
+    if (!dayMatch) return;
+    const day = parseInt(dayMatch[1], 10);
+    if (day < 1 || day > 31) return;
+
+    // 行頭の日付部分を除いた残りから時刻らしきものを拾う
+    const rest = joined.slice(dayMatch[0].length);
+    const times = [];
+    const re = /(\d{1,2})[:：.．](\d{2})/g;
+    let m;
+    while ((m = re.exec(rest)) !== null) {
+      const h = parseInt(m[1], 10);
+      const mm = parseInt(m[2], 10);
+      if (h <= 23 && mm <= 59) times.push(`${String(h).padStart(2, "0")}:${String(mm).padStart(2, "0")}`);
     }
 
+    if (times.length === 0) {
+      out.push({ day, checkin: "", breakStart: "", breakEnd: "", checkout: "" });
+      return;
+    }
+
+    out.push({
+      day,
+      checkin: times[0] || "",
+      breakStart: times.length >= 4 ? times[1] : "",
+      breakEnd: times.length >= 4 ? times[2] : "",
+      checkout: times.length >= 2 ? times[times.length - 1] : "",
+    });
+  });
+
+  return out;
+}
+
+async function runGoogleVisionOcr({ imageBase64, isPdf }) {
+  if (!GOOGLE_VISION_API_KEY) {
+    return { status: 500, body: { error: "サーバーにGOOGLE_VISION_API_KEYが設定されていません。" } };
+  }
+  if (isPdf) {
+    return { status: 400, body: { error: "Google Vision方式ではPDFに対応していません。画像(JPEG/PNG)を添付してください。" } };
+  }
+
+  const response = await fetch(`https://vision.googleapis.com/v1/images:annotate?key=${encodeURIComponent(GOOGLE_VISION_API_KEY)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      requests: [
+        {
+          image: { content: imageBase64 },
+          features: [{ type: "DOCUMENT_TEXT_DETECTION" }],
+          imageContext: { languageHints: ["ja"] },
+        },
+      ],
+    }),
+  });
+
+  const data = await response.json();
+
+  if (!response.ok || (data.responses && data.responses[0] && data.responses[0].error)) {
+    const msg =
+      (data.error && data.error.message) ||
+      (data.responses && data.responses[0] && data.responses[0].error && data.responses[0].error.message) ||
+      `Google Vision API HTTP ${response.status}`;
+    return { status: 502, body: { error: msg } };
+  }
+
+  const annotations = (data.responses && data.responses[0] && data.responses[0].textAnnotations) || [];
+  if (annotations.length === 0) {
+    return { status: 200, body: { rows: [], employeeName: "", workplaceName: "", provider: "google", note: "文字を検出できませんでした。" } };
+  }
+
+  const rows = extractRowsFromVision(annotations);
+  return {
+    status: 200,
+    body: {
+      rows,
+      employeeName: "",
+      workplaceName: "",
+      provider: "google",
+      note: "Google Vision方式は文字と座標のみを返すため、氏名・就業先の自動判別は行いません。時刻の対応付けも行単位の推定です。",
+    },
+  };
+}
+
+app.post("/api/ocr", async (req, res) => {
+  try {
     const rateKey = parseCookies(req).session || req.ip;
     if (!checkOcrRateLimit(rateKey)) {
       return res.status(429).json({ error: `短時間に読み取りが集中しています。${Math.ceil(OCR_RATE_WINDOW_MS / 60000)}分ほど時間を置いてから再試行してください。` });
     }
 
-    const { imageBase64, mimeType, isPdf, targetMonth } = req.body || {};
+    const { imageBase64, mimeType, isPdf, targetMonth, provider } = req.body || {};
     if (!imageBase64) {
       return res.status(400).json({ error: "画像データがありません。" });
     }
 
-    const contentBlock = isPdf
-      ? { type: "document", source: { type: "base64", media_type: "application/pdf", data: imageBase64 } }
-      : { type: "image", source: { type: "base64", media_type: mimeType || "image/jpeg", data: imageBase64 } };
+    const result =
+      provider === "google"
+        ? await runGoogleVisionOcr({ imageBase64, isPdf })
+        : await runAnthropicOcr({ imageBase64, mimeType, isPdf, targetMonth });
 
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        max_tokens: 4096,
-        messages: [
-          {
-            role: "user",
-            content: [contentBlock, { type: "text", text: buildPrompt(targetMonth || "") }],
-          },
-        ],
-      }),
-    });
-
-    const data = await response.json();
-
-    if (!response.ok || data.type === "error") {
-      const msg = (data.error && data.error.message) || `Anthropic API HTTP ${response.status}`;
-      return res.status(502).json({ error: msg });
-    }
-
-    const text = (data.content || []).map((b) => b.text || "").join("\n");
-    const jsonStart = text.indexOf("{");
-    const jsonEnd = text.lastIndexOf("}");
-    if (jsonStart === -1 || jsonEnd === -1) {
-      return res.status(502).json({ error: "AIの応答からJSONを検出できませんでした。" });
-    }
-
-    let parsed;
-    try {
-      parsed = JSON.parse(text.slice(jsonStart, jsonEnd + 1));
-    } catch (e) {
-      return res.status(502).json({ error: "AIの応答を解析できませんでした(出力が途中で切れた可能性があります)。" });
-    }
-
-    res.json(parsed);
+    res.status(result.status).json(result.body);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message || "不明なサーバーエラー" });
