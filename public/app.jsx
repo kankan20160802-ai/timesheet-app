@@ -419,31 +419,36 @@ function EmployeeTimesheet() {
         }
       }
 
-      let filledCount = 0;
+      // 件数の集計を setEntries の更新関数の中で行うと、
+      // React が更新関数を後から実行するため件数が 0 のまま表示されてしまう。
+      // そのため、新しい entries を先に組み立ててから set する。
       const resolveDay = makeDayResolver();
-      setEntries((prev) => {
-        const next = { ...prev };
-        rows.forEach((r) => {
-          const dateStr = resolveDay(r.day);
-          if (!dateStr) return;
-          const cur = next[dateStr] || { checkin: "", breakStart: "", breakEnd: "", checkout: "", auto: {} };
-          const updated = { ...cur, auto: { ...(cur.auto || {}) } };
-          ["checkin", "breakStart", "breakEnd", "checkout"].forEach((field) => {
-            const val = r[field];
-            if (val) {
-              updated[field] = val;
-              updated.auto[field] = true;
-              filledCount++;
-            }
-          });
-          next[dateStr] = updated;
+      let filledCount = 0;
+      let matchedRows = 0;
+      const nextEntries = { ...entries };
+
+      rows.forEach((r) => {
+        const dateStr = resolveDay(r.day);
+        if (!dateStr) return;
+        matchedRows++;
+        const cur = nextEntries[dateStr] || { checkin: "", breakStart: "", breakEnd: "", checkout: "", auto: {} };
+        const updated = { ...cur, auto: { ...(cur.auto || {}) } };
+        ["checkin", "breakStart", "breakEnd", "checkout"].forEach((field) => {
+          const val = r[field];
+          if (val) {
+            updated[field] = val;
+            updated.auto[field] = true;
+            filledCount++;
+          }
         });
-        return next;
+        nextEntries[dateStr] = updated;
       });
+
+      setEntries(nextEntries);
       setOcrStatus("done");
       const providerLabel = parsed.provider === "google" ? "Google Vision" : "Anthropic";
       setOcrMessage(
-        `[${providerLabel}] ${rows.length}日分を読み取り、${filledCount}件のマスに自動反映しました。黄色い欄は必ず原本と照合して確認してください。` +
+        `[${providerLabel}] ${rows.length}行を読み取り、うち${matchedRows}行が期間内の日付と一致、${filledCount}件のマスに自動反映しました。黄色い欄は必ず原本と照合して確認してください。` +
           (parsed.note ? ` ${parsed.note}` : "")
       );
     } catch (err) {
