@@ -197,28 +197,121 @@ async function runAnthropicOcr({ imageBase64, mimeType, isPdf, targetMonth }) {
 }
 
 // ---- Google Cloud Vision による読み取り ----
-// Vision は「文字と座標」しか返さないため、行ごとにまとめて時刻を拾う処理を自前で行う。
-function groupTokensIntoRows(tokens) {
-  if (tokens.length === 0) return [];
-  const heights = tokens.map((t) => t.height).sort((a, b) => a - b);
-  const medianHeight = heights[Math.floor(heights.length / 2)] || 10;
-  const tolerance = medianHeight * 0.6;
+// Vision は「文字と座標」しか返さないため、表の構造を座標から推定する必要がある。
 
+// 各トークンを1文字ずつに展開し、文字ごとにおおよそのX座標を持たせる。
+// これにより「13:17」がどの列にあるかを正確に判定できる。
+function expandTokenToChars(token) {
+  const chars = [];
+  const len = token.text.length;
+  if (len === 0) return chars;
+  const step = (token.xMax - token.xMin) / len;
+  for (let i = 0; i < len; i++) {
+    chars.push({ ch: token.text[i], x: token.xMin + step * (i + 0.5) });
+  }
+  return chars;
+}
+
+// Y座標でクラスタリングして行にまとめる。
+// 重心を更新しながら判定するため、多少の傾きがあっても崩れにくい。
+function groupTokensIntoRows(tokens, medianHeight) {
+  const tolerance = medianHeight * 0.8;
   const sorted = [...tokens].sort((a, b) => a.yCenter - b.yCenter);
   const rows = [];
-  let current = [sorted[0]];
 
-  for (let i = 1; i < sorted.length; i++) {
-    const prevY = current[current.length - 1].yCenter;
-    if (Math.abs(sorted[i].yCenter - prevY) <= tolerance) {
-      current.push(sorted[i]);
+  sorted.forEach((tok) => {
+    const last = rows[rows.length - 1];
+    if (last && Math.abs(tok.yCenter - last.centroid) <= tolerance) {
+      last.tokens.push(tok);
+      // 重心を更新(行が右下がりでも追従できる)
+      last.centroid = last.tokens.reduce((s, t) => s + t.yCenter, 0) / last.tokens.length;
     } else {
-      rows.push(current);
-      current = [sorted[i]];
+      rows.push({ centroid: tok.yCenter, tokens: [tok] });
+    }
+  });
+
+  return rows.map((r) => r.tokens.sort((a, b) => a.xMin - b.xMin));
+}
+
+// 1行分の文字列を組み立て、時刻とその位置(X座標)を取り出す
+function findTimesInRow(rowTokens) {
+  const chars = [];
+  rowTokens.forEach((t) => chars.push(...expandTokenToChars(t)));
+
+  // 全角を半角に寄せてから探す
+  const normalized = chars.map((c) => {
+    let ch = c.ch;
+    if (ch >= "０" && ch <= "９") ch = String.fromCharCode(ch.charCodeAt(0) - 0xfee0);
+    if ("：；;．。・".includes(ch)) ch = ":";
+    return { ch, x: c.x };
+  });
+
+  const joined = normalized.map((c) => c.ch).join("");
+  const results = [];
+  const re = /(\d{1,2}):(\d{2})/g;
+  let m;
+  while ((m = re.exec(joined)) !== null) {
+    const h = parseInt(m[1], 10);
+    const mm = parseInt(m[2], 10);
+    if (h > 23 || mm > 59) continue;
+    const startIdx = m.index;
+    const endIdx = m.index + m[0].length - 1;
+    const xCenter = (normalized[startIdx].x + normalized[endIdx].x) / 2;
+    results.push({ time: `${String(h).padStart(2, "0")}:${String(mm).padStart(2, "0")}`, x: xCenter });
+  }
+  return { joined, times: results };
+}
+
+// 行頭付近の数字を日付として取り出す(日付列のX範囲を使う)
+function findDayInRow(rowTokens, dayColumnMaxX) {
+  for (const t of rowTokens) {
+    if (dayColumnMaxX != null && t.xMin > dayColumnMaxX) break;
+    const norm = t.text.replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0));
+    const m = /^(\d{1,2})$/.exec(norm.trim());
+    if (m) {
+      const d = parseInt(m[1], 10);
+      if (d >= 1 && d <= 31) return d;
     }
   }
-  rows.push(current);
-  return rows.map((r) => r.sort((a, b) => a.xCenter - b.xCenter));
+  return null;
+}
+
+// 時刻のX座標をクラスタリングして「列」を割り出す
+function clusterColumns(xValues, expectedMax = 4) {
+  if (xValues.length === 0) return [];
+  const sorted = [...xValues].sort((a, b) => a - b);
+  const span = sorted[sorted.length - 1] - sorted[0];
+  if (span <= 0) return [{ min: sorted[0], max: sorted[0], center: sorted[0] }];
+
+  // 隣り合う値の差が大きい箇所で区切る
+  const gaps = [];
+  for (let i = 1; i < sorted.length; i++) {
+    gaps.push({ idx: i, gap: sorted[i] - sorted[i - 1] });
+  }
+  gaps.sort((a, b) => b.gap - a.gap);
+
+  const cutCount = Math.min(expectedMax - 1, gaps.length);
+  const cutIndices = gaps
+    .slice(0, cutCount)
+    .filter((g) => g.gap > span * 0.12) // 小さすぎる隙間では区切らない
+    .map((g) => g.idx)
+    .sort((a, b) => a - b);
+
+  const clusters = [];
+  let start = 0;
+  [...cutIndices, sorted.length].forEach((cut) => {
+    const slice = sorted.slice(start, cut);
+    if (slice.length > 0) {
+      clusters.push({
+        min: slice[0],
+        max: slice[slice.length - 1],
+        center: slice.reduce((s, v) => s + v, 0) / slice.length,
+      });
+    }
+    start = cut;
+  });
+
+  return clusters;
 }
 
 function extractRowsFromVision(annotations) {
@@ -227,49 +320,74 @@ function extractRowsFromVision(annotations) {
     const ys = a.boundingPoly.vertices.map((v) => v.y || 0);
     return {
       text: a.description,
-      xCenter: (Math.min(...xs) + Math.max(...xs)) / 2,
+      xMin: Math.min(...xs),
+      xMax: Math.max(...xs),
       yCenter: (Math.min(...ys) + Math.max(...ys)) / 2,
       height: Math.max(...ys) - Math.min(...ys),
     };
   });
 
-  const rows = groupTokensIntoRows(tokens);
-  const out = [];
+  if (tokens.length === 0) return { rows: [], debug: { tokenCount: 0 } };
 
-  rows.forEach((rowTokens) => {
-    const joined = rowTokens.map((t) => t.text).join("");
-    // 行頭の数字を日付とみなす
-    const dayMatch = /^(\d{1,2})/.exec(joined);
-    if (!dayMatch) return;
-    const day = parseInt(dayMatch[1], 10);
-    if (day < 1 || day > 31) return;
+  const heights = tokens.map((t) => t.height).sort((a, b) => a - b);
+  const medianHeight = heights[Math.floor(heights.length / 2)] || 10;
 
-    // 行頭の日付部分を除いた残りから時刻らしきものを拾う
-    const rest = joined.slice(dayMatch[0].length);
-    const times = [];
-    const re = /(\d{1,2})[:：.．](\d{2})/g;
-    let m;
-    while ((m = re.exec(rest)) !== null) {
-      const h = parseInt(m[1], 10);
-      const mm = parseInt(m[2], 10);
-      if (h <= 23 && mm <= 59) times.push(`${String(h).padStart(2, "0")}:${String(mm).padStart(2, "0")}`);
-    }
+  const rowGroups = groupTokensIntoRows(tokens, medianHeight);
 
-    if (times.length === 0) {
-      out.push({ day, checkin: "", breakStart: "", breakEnd: "", checkout: "" });
-      return;
-    }
+  // 日付列のX範囲を推定する:各行の左端トークンのX位置の分布から求める
+  const leftMostXs = rowGroups.map((r) => r[0].xMax).sort((a, b) => a - b);
+  const dayColumnMaxX = leftMostXs.length > 0 ? leftMostXs[Math.floor(leftMostXs.length * 0.7)] * 1.5 : null;
 
-    out.push({
-      day,
-      checkin: times[0] || "",
-      breakStart: times.length >= 4 ? times[1] : "",
-      breakEnd: times.length >= 4 ? times[2] : "",
-      checkout: times.length >= 2 ? times[times.length - 1] : "",
-    });
+  // まず全行から時刻を抽出し、X座標を集めて列を決める
+  const perRow = rowGroups.map((rowTokens) => {
+    const { joined, times } = findTimesInRow(rowTokens);
+    const day = findDayInRow(rowTokens, dayColumnMaxX);
+    return { rowTokens, joined, times, day };
   });
 
-  return out;
+  const allTimeXs = [];
+  perRow.forEach((r) => r.times.forEach((t) => allTimeXs.push(t.x)));
+  const columns = clusterColumns(allTimeXs, 4);
+
+  // 列を左から順に 出社 / 休憩開始 / 休憩終了 / 退社 に割り当てる
+  function assignField(x) {
+    if (columns.length === 0) return null;
+    let bestIdx = 0;
+    let bestDist = Infinity;
+    columns.forEach((c, i) => {
+      const d = Math.abs(x - c.center);
+      if (d < bestDist) {
+        bestDist = d;
+        bestIdx = i;
+      }
+    });
+    if (columns.length === 1) return "checkin";
+    if (columns.length === 2) return bestIdx === 0 ? "checkin" : "checkout";
+    if (columns.length === 3) return ["checkin", "breakStart", "checkout"][bestIdx];
+    return ["checkin", "breakStart", "breakEnd", "checkout"][bestIdx];
+  }
+
+  const out = [];
+  perRow.forEach((r) => {
+    if (r.day == null) return;
+    const entry = { day: r.day, checkin: "", breakStart: "", breakEnd: "", checkout: "" };
+    r.times.forEach((t) => {
+      const field = assignField(t.x);
+      if (field && !entry[field]) entry[field] = t.time;
+    });
+    out.push(entry);
+  });
+
+  return {
+    rows: out,
+    debug: {
+      tokenCount: tokens.length,
+      rowCount: rowGroups.length,
+      rowsWithDay: out.length,
+      timeCount: allTimeXs.length,
+      columnCount: columns.length,
+    },
+  };
 }
 
 async function runGoogleVisionOcr({ imageBase64, isPdf }) {
@@ -309,7 +427,7 @@ async function runGoogleVisionOcr({ imageBase64, isPdf }) {
     return { status: 200, body: { rows: [], employeeName: "", workplaceName: "", provider: "google", note: "文字を検出できませんでした。" } };
   }
 
-  const rows = extractRowsFromVision(annotations);
+  const { rows, debug } = extractRowsFromVision(annotations);
   return {
     status: 200,
     body: {
@@ -317,7 +435,7 @@ async function runGoogleVisionOcr({ imageBase64, isPdf }) {
       employeeName: "",
       workplaceName: "",
       provider: "google",
-      note: "Google Vision方式は文字と座標のみを返すため、氏名・就業先の自動判別は行いません。時刻の対応付けも行単位の推定です。",
+      note: `解析内訳: 検出文字${debug.tokenCount}個 / 行${debug.rowCount} / 日付付き行${debug.rowsWithDay} / 時刻${debug.timeCount}個 / 列${debug.columnCount}。氏名・就業先の自動判別は行いません。`,
     },
   };
 }
