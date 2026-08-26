@@ -263,13 +263,17 @@ function findTimesInRow(rowTokens) {
 }
 
 // 行頭付近の数字を日付として取り出す。
-// 「21火」のように曜日と結合して認識される場合があるため、完全一致ではなく数字を抽出する。
+// 「21火」のように曜日と結合して認識される場合があるため、先頭の数字を抽出する。
+// ただし「13:17」のような時刻を日付と誤認しないよう、直後がコロンや数字の場合は除外する。
 function findDayInRow(rowTokens, leftBoundaryX) {
   for (const t of rowTokens) {
-    // 出社列より右側は日付ではないので打ち切る
+    // 日付列より右側は対象外
     if (leftBoundaryX != null && t.xMin >= leftBoundaryX) break;
-    const norm = t.text.replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0));
-    const m = /(\d{1,2})/.exec(norm);
+    const norm = t.text
+      .replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0))
+      .replace(/[：；．。・]/g, ":")
+      .trim();
+    const m = /^(\d{1,2})(?![\d:])/.exec(norm);
     if (m) {
       const d = parseInt(m[1], 10);
       if (d >= 1 && d <= 31) return d;
@@ -278,8 +282,7 @@ function findDayInRow(rowTokens, leftBoundaryX) {
   return null;
 }
 
-// 表ヘッダー(出社・休憩・退社)を見つけ、列のX位置の基準にする。
-// 決まった様式なので、これが取れれば列判定が安定する。
+// 表ヘッダー(日付・曜日・出社・休憩・退社)を見つけ、列の基準にする。
 function findHeaderAnchors(tokens) {
   const anchors = {};
   let headerY = null;
@@ -287,14 +290,19 @@ function findHeaderAnchors(tokens) {
   tokens.forEach((t) => {
     const txt = t.text;
     const xc = (t.xMin + t.xMax) / 2;
-    if (/出社|出勤/.test(txt) && anchors.checkin == null) {
+    if (/曜日/.test(txt) && anchors.dowXMax == null) {
+      anchors.dowXMax = t.xMax;
+    } else if (/出社|出勤/.test(txt) && anchors.checkin == null) {
       anchors.checkin = xc;
+      anchors.checkinXMin = t.xMin;
       headerY = t.yCenter;
     } else if (/休憩/.test(txt) && anchors.breakCenter == null) {
       anchors.breakCenter = xc;
-      anchors.breakWidth = t.xMax - t.xMin;
+      anchors.breakXMin = t.xMin;
+      anchors.breakXMax = t.xMax;
     } else if (/退社|退勤/.test(txt) && anchors.checkout == null) {
       anchors.checkout = xc;
+      anchors.checkoutXMin = t.xMin;
       if (headerY == null) headerY = t.yCenter;
     }
   });
@@ -331,8 +339,14 @@ function extractRowsFromVision(annotations) {
     return y > header.headerY + medianHeight * 0.5;
   });
 
-  // 出社列の左端を日付列との境界とする
-  const leftBoundaryX = header ? header.checkin - medianHeight * 2 : null;
+  // 日付列との境界:曜日ヘッダーの右端(なければ出社ヘッダーの左端)
+  const leftBoundaryX = header
+    ? header.dowXMax != null
+      ? header.dowXMax
+      : header.checkinXMin != null
+      ? header.checkinXMin
+      : header.checkin - medianHeight * 3
+    : null;
 
   const perRow = dataRowGroups.map((rowTokens) => {
     const { joined, times } = findTimesInRow(rowTokens);
@@ -340,68 +354,58 @@ function extractRowsFromVision(annotations) {
     return { rowTokens, joined, times, day };
   });
 
-  // 列の基準:ヘッダーが取れていればそれを使い、なければ時刻のX座標から推定する
-  let assignField;
-  let columnCount;
+  // 行内の時刻を「左から順に」出社→(休憩)→退社と割り当てる。
+  // 手書きは列内で左右にぶれるため、ヘッダー中心からの距離より並び順の方が安定する。
+  // 休憩欄はほぼ空欄で運用されているため、2個なら出社・退社とみなすのが実態に合う。
+  const rightLimit = header ? header.checkout + (header.checkout - header.checkin) * 0.6 : null;
 
-  if (header) {
-    const bStart = header.breakCenter != null ? header.breakCenter - (header.breakWidth || 0) * 0.25 : null;
-    const bEnd = header.breakCenter != null ? header.breakCenter + (header.breakWidth || 0) * 0.25 : null;
-    const anchorList = [
-      { field: "checkin", x: header.checkin },
-      ...(bStart != null ? [{ field: "breakStart", x: bStart }] : []),
-      ...(bEnd != null ? [{ field: "breakEnd", x: bEnd }] : []),
-      { field: "checkout", x: header.checkout },
-    ];
-    columnCount = anchorList.length;
-    assignField = (x) => {
-      let best = anchorList[0];
-      let bestDist = Infinity;
-      anchorList.forEach((a) => {
-        const d = Math.abs(x - a.x);
-        if (d < bestDist) {
-          bestDist = d;
-          best = a;
-        }
-      });
-      // 退社列より大きく右にある時刻(残業時間欄など)は無視する
-      if (x > header.checkout + (header.checkout - header.checkin) * 0.5) return null;
-      return best.field;
-    };
-  } else {
-    const allTimeXs = [];
-    perRow.forEach((r) => r.times.forEach((t) => allTimeXs.push(t.x)));
-    const columns = clusterColumns(allTimeXs, 4);
-    columnCount = columns.length;
-    assignField = (x) => {
-      if (columns.length === 0) return null;
-      let bestIdx = 0;
-      let bestDist = Infinity;
-      columns.forEach((c, i) => {
-        const d = Math.abs(x - c.center);
-        if (d < bestDist) {
-          bestDist = d;
-          bestIdx = i;
-        }
-      });
-      if (columns.length === 1) return "checkin";
-      if (columns.length === 2) return bestIdx === 0 ? "checkin" : "checkout";
-      if (columns.length === 3) return ["checkin", "breakStart", "checkout"][bestIdx];
-      return ["checkin", "breakStart", "breakEnd", "checkout"][bestIdx];
-    };
+  function assignRowTimes(times) {
+    // 退社列より大きく右にある時刻(勤務時間・残業時間欄の誤検出)は除外
+    const valid = times
+      .filter((t) => (rightLimit == null ? true : t.x <= rightLimit))
+      .sort((a, b) => a.x - b.x);
+
+    const entry = { checkin: "", breakStart: "", breakEnd: "", checkout: "" };
+    if (valid.length === 0) return entry;
+
+    if (valid.length === 1) {
+      // 1つだけの場合は位置で出社か退社かを判断する
+      if (header) {
+        const distIn = Math.abs(valid[0].x - header.checkin);
+        const distOut = Math.abs(valid[0].x - header.checkout);
+        entry[distIn <= distOut ? "checkin" : "checkout"] = valid[0].time;
+      } else {
+        entry.checkin = valid[0].time;
+      }
+    } else if (valid.length === 2) {
+      entry.checkin = valid[0].time;
+      entry.checkout = valid[1].time;
+    } else if (valid.length === 3) {
+      entry.checkin = valid[0].time;
+      entry.checkout = valid[2].time;
+      // 真ん中は休憩のどちらか:位置で判断する
+      if (header && header.breakCenter != null) {
+        entry[valid[1].x <= header.breakCenter ? "breakStart" : "breakEnd"] = valid[1].time;
+      } else {
+        entry.breakStart = valid[1].time;
+      }
+    } else {
+      entry.checkin = valid[0].time;
+      entry.breakStart = valid[1].time;
+      entry.breakEnd = valid[2].time;
+      entry.checkout = valid[valid.length - 1].time;
+    }
+    return entry;
   }
 
   let timeCount = 0;
   const out = [];
   perRow.forEach((r) => {
     if (r.day == null) return;
-    const entry = { day: r.day, checkin: "", breakStart: "", breakEnd: "", checkout: "" };
-    r.times.forEach((t) => {
-      const field = assignField(t.x);
-      if (field && !entry[field]) {
-        entry[field] = t.time;
-        timeCount++;
-      }
+    const assigned = assignRowTimes(r.times);
+    const entry = { day: r.day, ...assigned };
+    ["checkin", "breakStart", "breakEnd", "checkout"].forEach((f) => {
+      if (entry[f]) timeCount++;
     });
     out.push(entry);
   });
@@ -413,7 +417,6 @@ function extractRowsFromVision(annotations) {
       rowCount: dataRowGroups.length,
       rowsWithDay: out.length,
       timeCount,
-      columnCount,
       headerFound: !!header,
     },
   };
@@ -502,7 +505,7 @@ async function runGoogleVisionOcr({ imageBase64, isPdf }) {
       employeeName: "",
       workplaceName: "",
       provider: "google",
-      note: `解析内訳: 検出文字${debug.tokenCount}個 / 行${debug.rowCount} / 日付付き行${debug.rowsWithDay} / 時刻${debug.timeCount}個 / 列${debug.columnCount}。氏名・就業先の自動判別は行いません。`,
+      note: `解析内訳: 検出文字${debug.tokenCount}個 / 行${debug.rowCount} / 日付付き行${debug.rowsWithDay} / 時刻${debug.timeCount}個 / ヘッダー検出${debug.headerFound ? "成功" : "失敗"}。氏名・就業先の自動判別は行いません。`,
     },
   };
 }
