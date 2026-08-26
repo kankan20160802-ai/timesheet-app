@@ -262,18 +262,161 @@ function findTimesInRow(rowTokens) {
   return { joined, times: results };
 }
 
-// 行頭付近の数字を日付として取り出す(日付列のX範囲を使う)
-function findDayInRow(rowTokens, dayColumnMaxX) {
+// 行頭付近の数字を日付として取り出す。
+// 「21火」のように曜日と結合して認識される場合があるため、完全一致ではなく数字を抽出する。
+function findDayInRow(rowTokens, leftBoundaryX) {
   for (const t of rowTokens) {
-    if (dayColumnMaxX != null && t.xMin > dayColumnMaxX) break;
+    // 出社列より右側は日付ではないので打ち切る
+    if (leftBoundaryX != null && t.xMin >= leftBoundaryX) break;
     const norm = t.text.replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0));
-    const m = /^(\d{1,2})$/.exec(norm.trim());
+    const m = /(\d{1,2})/.exec(norm);
     if (m) {
       const d = parseInt(m[1], 10);
       if (d >= 1 && d <= 31) return d;
     }
   }
   return null;
+}
+
+// 表ヘッダー(出社・休憩・退社)を見つけ、列のX位置の基準にする。
+// 決まった様式なので、これが取れれば列判定が安定する。
+function findHeaderAnchors(tokens) {
+  const anchors = {};
+  let headerY = null;
+
+  tokens.forEach((t) => {
+    const txt = t.text;
+    const xc = (t.xMin + t.xMax) / 2;
+    if (/出社|出勤/.test(txt) && anchors.checkin == null) {
+      anchors.checkin = xc;
+      headerY = t.yCenter;
+    } else if (/休憩/.test(txt) && anchors.breakCenter == null) {
+      anchors.breakCenter = xc;
+      anchors.breakWidth = t.xMax - t.xMin;
+    } else if (/退社|退勤/.test(txt) && anchors.checkout == null) {
+      anchors.checkout = xc;
+      if (headerY == null) headerY = t.yCenter;
+    }
+  });
+
+  if (anchors.checkin == null || anchors.checkout == null) return null;
+  return { ...anchors, headerY };
+}
+
+function extractRowsFromVision(annotations) {
+  const tokens = annotations.slice(1).map((a) => {
+    const xs = a.boundingPoly.vertices.map((v) => v.x || 0);
+    const ys = a.boundingPoly.vertices.map((v) => v.y || 0);
+    return {
+      text: a.description,
+      xMin: Math.min(...xs),
+      xMax: Math.max(...xs),
+      yCenter: (Math.min(...ys) + Math.max(...ys)) / 2,
+      height: Math.max(...ys) - Math.min(...ys),
+    };
+  });
+
+  if (tokens.length === 0) return { rows: [], debug: { tokenCount: 0 } };
+
+  const heights = tokens.map((t) => t.height).sort((a, b) => a - b);
+  const medianHeight = heights[Math.floor(heights.length / 2)] || 10;
+
+  const header = findHeaderAnchors(tokens);
+  const rowGroups = groupTokensIntoRows(tokens, medianHeight);
+
+  // ヘッダーより上の行(タイトルや注意書き)は集計対象から除外する
+  const dataRowGroups = rowGroups.filter((rowTokens) => {
+    if (!header || header.headerY == null) return true;
+    const y = rowTokens.reduce((s, t) => s + t.yCenter, 0) / rowTokens.length;
+    return y > header.headerY + medianHeight * 0.5;
+  });
+
+  // 出社列の左端を日付列との境界とする
+  const leftBoundaryX = header ? header.checkin - medianHeight * 2 : null;
+
+  const perRow = dataRowGroups.map((rowTokens) => {
+    const { joined, times } = findTimesInRow(rowTokens);
+    const day = findDayInRow(rowTokens, leftBoundaryX);
+    return { rowTokens, joined, times, day };
+  });
+
+  // 列の基準:ヘッダーが取れていればそれを使い、なければ時刻のX座標から推定する
+  let assignField;
+  let columnCount;
+
+  if (header) {
+    const bStart = header.breakCenter != null ? header.breakCenter - (header.breakWidth || 0) * 0.25 : null;
+    const bEnd = header.breakCenter != null ? header.breakCenter + (header.breakWidth || 0) * 0.25 : null;
+    const anchorList = [
+      { field: "checkin", x: header.checkin },
+      ...(bStart != null ? [{ field: "breakStart", x: bStart }] : []),
+      ...(bEnd != null ? [{ field: "breakEnd", x: bEnd }] : []),
+      { field: "checkout", x: header.checkout },
+    ];
+    columnCount = anchorList.length;
+    assignField = (x) => {
+      let best = anchorList[0];
+      let bestDist = Infinity;
+      anchorList.forEach((a) => {
+        const d = Math.abs(x - a.x);
+        if (d < bestDist) {
+          bestDist = d;
+          best = a;
+        }
+      });
+      // 退社列より大きく右にある時刻(残業時間欄など)は無視する
+      if (x > header.checkout + (header.checkout - header.checkin) * 0.5) return null;
+      return best.field;
+    };
+  } else {
+    const allTimeXs = [];
+    perRow.forEach((r) => r.times.forEach((t) => allTimeXs.push(t.x)));
+    const columns = clusterColumns(allTimeXs, 4);
+    columnCount = columns.length;
+    assignField = (x) => {
+      if (columns.length === 0) return null;
+      let bestIdx = 0;
+      let bestDist = Infinity;
+      columns.forEach((c, i) => {
+        const d = Math.abs(x - c.center);
+        if (d < bestDist) {
+          bestDist = d;
+          bestIdx = i;
+        }
+      });
+      if (columns.length === 1) return "checkin";
+      if (columns.length === 2) return bestIdx === 0 ? "checkin" : "checkout";
+      if (columns.length === 3) return ["checkin", "breakStart", "checkout"][bestIdx];
+      return ["checkin", "breakStart", "breakEnd", "checkout"][bestIdx];
+    };
+  }
+
+  let timeCount = 0;
+  const out = [];
+  perRow.forEach((r) => {
+    if (r.day == null) return;
+    const entry = { day: r.day, checkin: "", breakStart: "", breakEnd: "", checkout: "" };
+    r.times.forEach((t) => {
+      const field = assignField(t.x);
+      if (field && !entry[field]) {
+        entry[field] = t.time;
+        timeCount++;
+      }
+    });
+    out.push(entry);
+  });
+
+  return {
+    rows: out,
+    debug: {
+      tokenCount: tokens.length,
+      rowCount: dataRowGroups.length,
+      rowsWithDay: out.length,
+      timeCount,
+      columnCount,
+      headerFound: !!header,
+    },
+  };
 }
 
 // 時刻のX座標をクラスタリングして「列」を割り出す
@@ -312,82 +455,6 @@ function clusterColumns(xValues, expectedMax = 4) {
   });
 
   return clusters;
-}
-
-function extractRowsFromVision(annotations) {
-  const tokens = annotations.slice(1).map((a) => {
-    const xs = a.boundingPoly.vertices.map((v) => v.x || 0);
-    const ys = a.boundingPoly.vertices.map((v) => v.y || 0);
-    return {
-      text: a.description,
-      xMin: Math.min(...xs),
-      xMax: Math.max(...xs),
-      yCenter: (Math.min(...ys) + Math.max(...ys)) / 2,
-      height: Math.max(...ys) - Math.min(...ys),
-    };
-  });
-
-  if (tokens.length === 0) return { rows: [], debug: { tokenCount: 0 } };
-
-  const heights = tokens.map((t) => t.height).sort((a, b) => a - b);
-  const medianHeight = heights[Math.floor(heights.length / 2)] || 10;
-
-  const rowGroups = groupTokensIntoRows(tokens, medianHeight);
-
-  // 日付列のX範囲を推定する:各行の左端トークンのX位置の分布から求める
-  const leftMostXs = rowGroups.map((r) => r[0].xMax).sort((a, b) => a - b);
-  const dayColumnMaxX = leftMostXs.length > 0 ? leftMostXs[Math.floor(leftMostXs.length * 0.7)] * 1.5 : null;
-
-  // まず全行から時刻を抽出し、X座標を集めて列を決める
-  const perRow = rowGroups.map((rowTokens) => {
-    const { joined, times } = findTimesInRow(rowTokens);
-    const day = findDayInRow(rowTokens, dayColumnMaxX);
-    return { rowTokens, joined, times, day };
-  });
-
-  const allTimeXs = [];
-  perRow.forEach((r) => r.times.forEach((t) => allTimeXs.push(t.x)));
-  const columns = clusterColumns(allTimeXs, 4);
-
-  // 列を左から順に 出社 / 休憩開始 / 休憩終了 / 退社 に割り当てる
-  function assignField(x) {
-    if (columns.length === 0) return null;
-    let bestIdx = 0;
-    let bestDist = Infinity;
-    columns.forEach((c, i) => {
-      const d = Math.abs(x - c.center);
-      if (d < bestDist) {
-        bestDist = d;
-        bestIdx = i;
-      }
-    });
-    if (columns.length === 1) return "checkin";
-    if (columns.length === 2) return bestIdx === 0 ? "checkin" : "checkout";
-    if (columns.length === 3) return ["checkin", "breakStart", "checkout"][bestIdx];
-    return ["checkin", "breakStart", "breakEnd", "checkout"][bestIdx];
-  }
-
-  const out = [];
-  perRow.forEach((r) => {
-    if (r.day == null) return;
-    const entry = { day: r.day, checkin: "", breakStart: "", breakEnd: "", checkout: "" };
-    r.times.forEach((t) => {
-      const field = assignField(t.x);
-      if (field && !entry[field]) entry[field] = t.time;
-    });
-    out.push(entry);
-  });
-
-  return {
-    rows: out,
-    debug: {
-      tokenCount: tokens.length,
-      rowCount: rowGroups.length,
-      rowsWithDay: out.length,
-      timeCount: allTimeXs.length,
-      columnCount: columns.length,
-    },
-  };
 }
 
 async function runGoogleVisionOcr({ imageBase64, isPdf }) {
