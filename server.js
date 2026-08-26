@@ -238,16 +238,26 @@ function findTimesInRow(rowTokens) {
   const charSeq = buildCharSeq(rowTokens);
   const joined = charSeq.map((c) => c.ch).join("");
   const results = [];
+  // 「12:11」「17:35」が「12:17:35」のように連結して認識されることがあるため、
+  // コロンが3つ以上連なる形も分解できるようにする。
   const re = /(\d{1,2}):(\d{2})/g;
   let m;
   while ((m = re.exec(joined)) !== null) {
     const h = parseInt(m[1], 10);
     const mm = parseInt(m[2], 10);
-    if (h > 23 || mm > 59) continue;
+    if (h > 23 || mm > 59) {
+      re.lastIndex = m.index + 1; // 次の位置から探し直す
+      continue;
+    }
     const startIdx = m.index;
     const endIdx = m.index + m[0].length - 1;
+    const xStart = charSeq[startIdx].x;
     const xCenter = (charSeq[startIdx].x + charSeq[endIdx].x) / 2;
-    results.push({ time: `${String(h).padStart(2, "0")}:${String(mm).padStart(2, "0")}`, x: xCenter });
+    results.push({
+      time: `${String(h).padStart(2, "0")}:${String(mm).padStart(2, "0")}`,
+      x: xCenter,
+      xStart,
+    });
   }
   return { joined, times: results };
 }
@@ -360,7 +370,7 @@ function extractRowsFromVision(annotations) {
 
   const perRow = dataRowGroups.map((rowTokens) => {
     const { joined, times } = findTimesInRow(rowTokens);
-    const firstTimeX = times.length > 0 ? Math.min(...times.map((t) => t.x)) : null;
+    const firstTimeX = times.length > 0 ? Math.min(...times.map((t) => t.xStart)) : null;
     const day = findDayInRow(rowTokens, firstTimeX, fallbackBoundaryX);
     return { rowTokens, joined, times, day };
   });
