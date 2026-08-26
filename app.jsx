@@ -64,14 +64,42 @@ function buildWeeksFromRange(startStr, endStr) {
   return order.map((k) => groups.get(k));
 }
 
+function normalizeTimeInput(str) {
+  if (!str) return "";
+  return String(str)
+    // 全角数字を半角に
+    .replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0))
+    // 全角コロン・句点・ピリオド・中黒などを半角コロンに寄せる
+    .replace(/[：；;]/g, ":")
+    .replace(/[．。・.]/g, ":")
+    .replace(/[　\s]/g, "")
+    .trim();
+}
+
 function parseTimeToMinutes(str) {
-  if (!str) return null;
-  const m = /^(\d{1,2}):(\d{2})$/.exec(str.trim());
+  const s = normalizeTimeInput(str);
+  if (!s) return null;
+  // 分は必ず2桁(「13:5」が 13:05 か 13:50 か判別できないため、あえて弾く)
+  const m = /^(\d{1,2}):(\d{2})$/.exec(s);
   if (!m) return null;
   const h = parseInt(m[1], 10);
   const mm = parseInt(m[2], 10);
-  if (isNaN(h) || isNaN(mm) || mm > 59) return null;
+  if (isNaN(h) || isNaN(mm)) return null;
+  if (h > 23 || mm > 59) return null;
   return h * 60 + mm;
+}
+
+// 入力欄が「埋まっているのに時刻として解釈できない」場合を検出する
+function isInvalidTimeInput(str) {
+  if (!str || !String(str).trim()) return false; // 空欄は不正ではない
+  return parseTimeToMinutes(str) === null;
+}
+
+// 不正入力は赤、AI読み取り未確認は黄、それ以外は既定のスタイル
+function timeInputStyle(value, isAuto) {
+  if (isInvalidTimeInput(value)) return { background: "#F9E2DC", borderColor: "#A6432A", color: "#A6432A" };
+  if (isAuto) return { background: "#FDF3D9", borderColor: "#C9A227" };
+  return undefined;
 }
 
 function formatClock(minutes) {
@@ -97,34 +125,106 @@ function roundToUnit(minutes, unit, direction) {
   return Math.round(minutes / unit) * unit;
 }
 
-function WeeklyTimesheetCalculator() {
-  const [startDate, setStartDate] = useState("2026-07-19");
-  const [numWeeks, setNumWeeks] = useState(4);
-  const [unit, setUnit] = useState(15);
-  const [target, setTarget] = useState("punch"); // punch | daily | weekly
-  const [checkinDir, setCheckinDir] = useState("up");
-  const [checkoutDir, setCheckoutDir] = useState("down");
-  const [genericDir, setGenericDir] = useState("down");
-  const [weeklyLimitH, setWeeklyLimitH] = useState(28);
-  const [entries, setEntries] = useState({});
+const DRAFT_KEY = "timesheet_draft_v1";
+const ATTACH_KEY = "timesheet_attachments_v1";
 
-  const [periodMode, setPeriodMode] = useState("profile"); // 'profile' | 'manual'
-  const [targetMonth, setTargetMonth] = useState("2026-08");
-  const [profiles, setProfiles] = useState([
-    { id: "p1", name: "会社A(20日締め)", closingDay: "20", unit: 5, target: "punch", checkinDir: "up", checkoutDir: "down", genericDir: "down", weeklyLimitH: 28 },
-    { id: "p2", name: "会社B(末日締め)", closingDay: "endOfMonth", unit: 15, target: "daily", checkinDir: "up", checkoutDir: "down", genericDir: "down", weeklyLimitH: 28 },
-  ]);
-  const [selectedProfileId, setSelectedProfileId] = useState("p1");
+function loadDraft() {
+  try {
+    const raw = window.localStorage.getItem(DRAFT_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+const DEFAULT_PROFILES = [
+  { id: "p1", name: "会社A(20日締め)", closingDay: "20", unit: 5, target: "punch", checkinDir: "up", checkoutDir: "down", genericDir: "down", weeklyLimitH: 28 },
+  { id: "p2", name: "会社B(末日締め)", closingDay: "endOfMonth", unit: 15, target: "daily", checkinDir: "up", checkoutDir: "down", genericDir: "down", weeklyLimitH: 28 },
+];
+
+function EmployeeTimesheet() {
+  const draft = React.useRef(loadDraft()).current;
+
+  const [startDate, setStartDate] = useState(draft.startDate || "2026-07-19");
+  const [numWeeks, setNumWeeks] = useState(draft.numWeeks || 4);
+  const [unit, setUnit] = useState(draft.unit || 15);
+  const [target, setTarget] = useState(draft.target || "punch"); // punch | daily | weekly
+  const [checkinDir, setCheckinDir] = useState(draft.checkinDir || "up");
+  const [checkoutDir, setCheckoutDir] = useState(draft.checkoutDir || "down");
+  const [genericDir, setGenericDir] = useState(draft.genericDir || "down");
+  const [weeklyLimitH, setWeeklyLimitH] = useState(draft.weeklyLimitH || 28);
+  const [entries, setEntries] = useState(draft.entries || {});
+
+  const [periodMode, setPeriodMode] = useState(draft.periodMode || "profile"); // 'profile' | 'manual'
+  const [targetMonth, setTargetMonth] = useState(draft.targetMonth || "2026-08");
+  const [profiles, setProfiles] = useState(draft.profiles && draft.profiles.length ? draft.profiles : DEFAULT_PROFILES);
+  const [selectedProfileId, setSelectedProfileId] = useState(draft.selectedProfileId || "p1");
   const [newProfileName, setNewProfileName] = useState("");
   const [newProfileClosing, setNewProfileClosing] = useState("20");
-  const [attachments, setAttachments] = useState([]);
+  const [attachments, setAttachments] = useState(() => {
+    try {
+      const raw = window.localStorage.getItem(ATTACH_KEY);
+      return raw ? JSON.parse(raw) : [];
+    } catch (e) {
+      return [];
+    }
+  });
   const [activeAttachmentId, setActiveAttachmentId] = useState(null);
+  const [attachWarning, setAttachWarning] = useState("");
   const [ocrStatus, setOcrStatus] = useState("idle"); // idle | loading | done | error
+  const [ocrProvider, setOcrProvider] = useState(draft.ocrProvider || "anthropic"); // anthropic | google
   const [ocrMessage, setOcrMessage] = useState("");
   const [previewMode, setPreviewMode] = useState(false);
-  const [employeeName, setEmployeeName] = useState("");
-  const [workplaceName, setWorkplaceName] = useState("");
+  const [employeeName, setEmployeeName] = useState(draft.employeeName || "");
+  const [workplaceName, setWorkplaceName] = useState(draft.workplaceName || "");
+  const [creatorName, setCreatorName] = useState(draft.creatorName || "");
+  const [priorEntries, setPriorEntries] = useState(draft.priorEntries || {});
   const [autoName, setAutoName] = useState({ employeeName: false, workplaceName: false });
+
+  React.useEffect(() => {
+    const data = {
+      startDate, numWeeks, unit, target, checkinDir, checkoutDir, genericDir, weeklyLimitH,
+      entries, periodMode, targetMonth, profiles, selectedProfileId, employeeName, workplaceName, creatorName, priorEntries, ocrProvider,
+    };
+    try {
+      window.localStorage.setItem(DRAFT_KEY, JSON.stringify(data));
+    } catch (e) {
+      // 容量オーバー等は無視(致命的ではない)
+    }
+  }, [startDate, numWeeks, unit, target, checkinDir, checkoutDir, genericDir, weeklyLimitH, entries, periodMode, targetMonth, profiles, selectedProfileId, employeeName, workplaceName, creatorName, priorEntries, ocrProvider]);
+
+  // 添付画像はサイズが大きいため別キーに保存し、容量オーバー時は保存だけ諦める
+  React.useEffect(() => {
+    try {
+      window.localStorage.setItem(ATTACH_KEY, JSON.stringify(attachments));
+      setAttachWarning("");
+    } catch (e) {
+      setAttachWarning("添付画像が大きすぎるため、この端末に保存できませんでした(ページを再読み込みすると画像は消えます)。入力済みの時刻データは保存されています。");
+    }
+  }, [attachments]);
+
+  // 復元した添付があれば最初の1枚を選択状態にする
+  React.useEffect(() => {
+    if (!activeAttachmentId && attachments.length > 0) {
+      setActiveAttachmentId(attachments[0].id);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function clearDraft() {
+    if (!window.confirm("この端末に保存されている下書きを消去し、新しい入力を始めますか?")) return;
+    try {
+      window.localStorage.removeItem(DRAFT_KEY);
+      window.localStorage.removeItem(ATTACH_KEY);
+    } catch (e) {}
+    setEntries({});
+    setPriorEntries({});
+    setEmployeeName("");
+    setWorkplaceName("");
+    setCreatorName("");
+    setAttachments([]);
+    setActiveAttachmentId(null);
+  }
 
   function compressImage(dataUrl, maxDim = 1600, quality = 0.85) {
     return new Promise((resolve) => {
@@ -244,14 +344,41 @@ function WeeklyTimesheetCalculator() {
   }
 
   function getEntry(dateStr) {
-    return entries[dateStr] || { checkin: "", breakStart: "", breakEnd: "", checkout: "", auto: {} };
+    return entries[dateStr] || priorEntries[dateStr] || { checkin: "", breakStart: "", breakEnd: "", checkout: "", auto: {} };
   }
+
+  function getPriorEntry(dateStr) {
+    return priorEntries[dateStr] || { checkin: "", breakStart: "", breakEnd: "", checkout: "" };
+  }
+
+  function updatePriorEntry(dateStr, field, value) {
+    setPriorEntries((prev) => ({ ...prev, [dateStr]: { ...(prev[dateStr] || {}), [field]: value } }));
+  }
+
+  const priorRefDates = useMemo(() => {
+    const base = periodMode === "profile" && period ? period.start : startDate;
+    const out = [];
+    for (let i = 6; i >= 1; i--) {
+      out.push(toDateStr(addDays(base, -i)));
+    }
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [periodMode, period && period.start, startDate]);
 
   const allPeriodDays = useMemo(() => weeks.flat(), [weeks]);
 
-  function findDateStrForDay(day) {
-    const match = allPeriodDays.find((d) => parseInt(d.dateStr.split("-")[2], 10) === day);
-    return match ? match.dateStr : null;
+  // 期間が32日以上に及ぶと同じ「日」番号が2回現れるため、
+  // すでに割り当てた日付は再利用しないよう、前から順に消費して照合する。
+  function makeDayResolver() {
+    const used = new Set();
+    return function resolve(day) {
+      const match = allPeriodDays.find(
+        (d) => parseInt(d.dateStr.split("-")[2], 10) === day && !used.has(d.dateStr)
+      );
+      if (!match) return null;
+      used.add(match.dateStr);
+      return match.dateStr;
+    };
   }
 
   async function runOcrForActiveAttachment() {
@@ -269,6 +396,7 @@ function WeeklyTimesheetCalculator() {
           mimeType: activeAttachment.mimeType || "image/jpeg",
           isPdf: !!activeAttachment.isPdf,
           targetMonth,
+          provider: ocrProvider,
         }),
       });
 
@@ -291,28 +419,38 @@ function WeeklyTimesheetCalculator() {
         }
       }
 
+      // 件数の集計を setEntries の更新関数の中で行うと、
+      // React が更新関数を後から実行するため件数が 0 のまま表示されてしまう。
+      // そのため、新しい entries を先に組み立ててから set する。
+      const resolveDay = makeDayResolver();
       let filledCount = 0;
-      setEntries((prev) => {
-        const next = { ...prev };
-        rows.forEach((r) => {
-          const dateStr = findDateStrForDay(r.day);
-          if (!dateStr) return;
-          const cur = next[dateStr] || { checkin: "", breakStart: "", breakEnd: "", checkout: "", auto: {} };
-          const updated = { ...cur, auto: { ...(cur.auto || {}) } };
-          ["checkin", "breakStart", "breakEnd", "checkout"].forEach((field) => {
-            const val = r[field];
-            if (val) {
-              updated[field] = val;
-              updated.auto[field] = true;
-              filledCount++;
-            }
-          });
-          next[dateStr] = updated;
+      let matchedRows = 0;
+      const nextEntries = { ...entries };
+
+      rows.forEach((r) => {
+        const dateStr = resolveDay(r.day);
+        if (!dateStr) return;
+        matchedRows++;
+        const cur = nextEntries[dateStr] || { checkin: "", breakStart: "", breakEnd: "", checkout: "", auto: {} };
+        const updated = { ...cur, auto: { ...(cur.auto || {}) } };
+        ["checkin", "breakStart", "breakEnd", "checkout"].forEach((field) => {
+          const val = r[field];
+          if (val) {
+            updated[field] = val;
+            updated.auto[field] = true;
+            filledCount++;
+          }
         });
-        return next;
+        nextEntries[dateStr] = updated;
       });
+
+      setEntries(nextEntries);
       setOcrStatus("done");
-      setOcrMessage(`${rows.length}日分を読み取り、${filledCount}件のマスに自動反映しました。黄色い欄は必ず原本と照合して確認してください。`);
+      const providerLabel = parsed.provider === "google" ? "Google Vision" : "Anthropic";
+      setOcrMessage(
+        `[${providerLabel}] ${rows.length}行を読み取り、うち${matchedRows}行が期間内の日付と一致、${filledCount}件のマスに自動反映しました。黄色い欄は必ず原本と照合して確認してください。` +
+          (parsed.note ? ` ${parsed.note}` : "")
+      );
     } catch (err) {
       setOcrStatus("error");
       const isNetworkErr = err instanceof TypeError || (err && /fetch/i.test(err.message || ""));
@@ -378,6 +516,40 @@ function WeeklyTimesheetCalculator() {
 
   const grandOvertime = weekSummaries.reduce((a, w) => a + w.overtime, 0);
   const grandTotal = weekSummaries.reduce((a, w) => a + w.total, 0);
+
+  // 「暦週(日〜土)」だけでなく、どの曜日から数えても連続7日間で28時間を超えていないかチェックする
+  const rollingChecks = useMemo(() => {
+    const limitMin = Math.round(weeklyLimitH * 60);
+    return allPeriodDays.map(({ dateStr }) => {
+      let total = 0;
+      let hasAnyData = false;
+      for (let i = 0; i < 7; i++) {
+        const ds = toDateStr(addDays(dateStr, -i));
+        const c = computeDay(ds);
+        if (c.hasData) {
+          hasAnyData = true;
+          total += c.workMin;
+        }
+      }
+      return { dateStr, total, over: total > limitMin, hasAnyData };
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allPeriodDays, entries, priorEntries, unit, target, checkinDir, checkoutDir, genericDir, weeklyLimitH]);
+
+  const rollingViolations = rollingChecks.filter((r) => r.over);
+
+  // 時刻として認識できない入力を検出(集計から静かに漏れるのを防ぐ)
+  const invalidInputs = useMemo(() => {
+    const out = [];
+    const check = (dateStr, entry, label) => {
+      ["checkin", "breakStart", "breakEnd", "checkout"].forEach((f) => {
+        if (isInvalidTimeInput(entry[f])) out.push({ dateStr, field: f, value: entry[f], label });
+      });
+    };
+    allPeriodDays.forEach(({ dateStr }) => check(dateStr, entries[dateStr] || {}, "期間内"));
+    Object.keys(priorEntries).forEach((dateStr) => check(dateStr, priorEntries[dateStr] || {}, "参考"));
+    return out;
+  }, [allPeriodDays, entries, priorEntries]);
 
   return (
     <div style={{ background: "var(--bg)", minHeight: "100%", fontFamily: "var(--font-body)" }}>
@@ -455,9 +627,26 @@ function WeeklyTimesheetCalculator() {
         }}
       >
         <div style={{ fontSize: 12, color: "var(--ink-soft)" }}>
-          {previewMode ? "PDF出力プレビュー中(実際に印刷される内容の見た目です)" : "編集モード"}
+          {previewMode ? "PDF出力プレビュー中(実際に印刷される内容の見た目です)" : "編集モード ・ この端末に自動保存されています"}
         </div>
         <div style={{ display: "flex", gap: 8 }}>
+          {!previewMode && (
+            <button
+              onClick={clearDraft}
+              style={{
+                padding: "8px 14px",
+                borderRadius: 8,
+                fontSize: 13,
+                fontWeight: 600,
+                border: "1px solid var(--line)",
+                background: "#fff",
+                color: "var(--ink-soft)",
+                cursor: "pointer",
+              }}
+            >
+              下書きを消去(新規入力)
+            </button>
+          )}
           <button
             onClick={() => setPreviewMode((v) => !v)}
             style={{
@@ -505,9 +694,56 @@ function WeeklyTimesheetCalculator() {
             <div style={{ display: "flex", gap: 24, marginTop: 8, fontSize: 13, color: "var(--ink)" }}>
               {employeeName && <div>氏名　<strong>{employeeName}</strong></div>}
               {workplaceName && <div>就業先　<strong>{workplaceName}</strong></div>}
+              {creatorName && <div>作成者　<strong>{creatorName}</strong></div>}
             </div>
           )}
         </div>
+
+        {employeeName && (
+          <div
+            className="no-print"
+            style={{
+              background: "#FDF3D9",
+              border: "1px solid #C9A227",
+              borderRadius: 8,
+              padding: "10px 16px",
+              marginBottom: 16,
+              fontSize: 13,
+              color: "#6B5210",
+              fontWeight: 600,
+            }}
+          >
+            現在「{employeeName}」さんのデータを編集しています。別の人の分を新しく始める前に、右上の「下書きを消去」を押してください。
+          </div>
+        )}
+
+        {invalidInputs.length > 0 && (
+          <div
+            className="no-print"
+            style={{
+              background: "var(--warn-soft)",
+              border: "1px solid var(--warn)",
+              borderRadius: 8,
+              padding: "10px 16px",
+              marginBottom: 16,
+              fontSize: 13,
+              color: "var(--warn)",
+              lineHeight: 1.7,
+            }}
+          >
+            <strong>時刻として認識できない入力が {invalidInputs.length} 件あります(赤い欄)。</strong>
+            <br />
+            このままでは集計に含まれません。全角の「：」や打ち間違いがないか確認してください(正しい例: 13:17)。
+            <div style={{ marginTop: 6, fontFamily: "var(--font-mono)", fontSize: 12 }}>
+              {invalidInputs.slice(0, 8).map((v, i) => (
+                <span key={i} style={{ marginRight: 12 }}>
+                  {v.dateStr}「{v.value}」
+                </span>
+              ))}
+              {invalidInputs.length > 8 && <span>ほか{invalidInputs.length - 8}件</span>}
+            </div>
+          </div>
+        )}
 
         <div className="no-print" style={{ background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 10, padding: "16px 24px", marginBottom: 20, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 16 }}>
           <div>
@@ -554,6 +790,16 @@ function WeeklyTimesheetCalculator() {
               }}
             />
           </div>
+          <div>
+            <label style={{ fontSize: 12, color: "var(--ink-soft)", display: "block", marginBottom: 4 }}>作成者(担当者名)</label>
+            <input
+              type="text"
+              placeholder="例: 藤崎"
+              value={creatorName}
+              onChange={(e) => setCreatorName(e.target.value)}
+              style={{ border: "1px solid var(--line)", borderRadius: 6, padding: "7px 10px", fontSize: 14, width: "100%" }}
+            />
+          </div>
         </div>
 
         <div className="no-print" style={{ marginBottom: 28 }}>
@@ -595,6 +841,12 @@ function WeeklyTimesheetCalculator() {
               <input type="file" accept="image/*,application/pdf" multiple onChange={handleFilesSelected} style={{ display: "none" }} />
             </label>
           </div>
+
+          {attachWarning && (
+            <div style={{ fontSize: 12, color: "var(--warn)", background: "var(--warn-soft)", border: "1px solid var(--warn)", borderRadius: 6, padding: "8px 12px", marginBottom: 12, lineHeight: 1.6 }}>
+              {attachWarning}
+            </div>
+          )}
 
           {attachments.length > 0 && (
             <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: activeAttachment ? 14 : 0 }}>
@@ -662,6 +914,29 @@ function WeeklyTimesheetCalculator() {
                 textAlign: "center",
               }}
             >
+              <div style={{ display: "flex", justifyContent: "center", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+                <span style={{ fontSize: 12, color: "var(--ink-soft)" }}>読み取り方式</span>
+                {[
+                  { v: "anthropic", l: "Anthropic" },
+                  { v: "google", l: "Google Vision" },
+                ].map((opt) => (
+                  <button
+                    key={opt.v}
+                    onClick={() => setOcrProvider(opt.v)}
+                    style={{
+                      padding: "5px 12px",
+                      borderRadius: 999,
+                      fontSize: 12,
+                      border: `1px solid ${ocrProvider === opt.v ? "var(--accent)" : "var(--line)"}`,
+                      background: ocrProvider === opt.v ? "var(--accent-soft)" : "#fff",
+                      color: ocrProvider === opt.v ? "var(--accent)" : "var(--ink-soft)",
+                      cursor: "pointer",
+                    }}
+                  >
+                    {opt.l}
+                  </button>
+                ))}
+              </div>
               <div style={{ display: "flex", justifyContent: "center", marginBottom: 10 }}>
                 <button
                   onClick={runOcrForActiveAttachment}
@@ -841,6 +1116,50 @@ function WeeklyTimesheetCalculator() {
           )}
         </div>
 
+        {/* Prior-period reference days (for accurate rolling 7-day check at the start of the period) */}
+        <div className="no-print" style={{ background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 10, padding: "16px 24px", marginBottom: 20 }}>
+          <div style={{ fontFamily: "var(--font-display)", fontWeight: 600, fontSize: 14, color: "var(--ink)", marginBottom: 4 }}>
+            前期間末の参考データ(任意)
+          </div>
+          <p style={{ fontSize: 12, color: "var(--ink-soft)", marginTop: 0, marginBottom: 12, lineHeight: 1.6 }}>
+            期間の最初の数日の「連続7日間チェック」を正確にするための補助入力です。表やPDFには出ず、ローリングチェックの計算にのみ使われます。
+            同じ人の前期間のデータが残っている場合は入力不要です。
+          </p>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+              <thead>
+                <tr style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>
+                  {["日付", "出社", "休憩開始", "休憩終了", "退社"].map((h) => (
+                    <th key={h} style={{ padding: "6px 8px", textAlign: "center", fontWeight: 600 }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {priorRefDates.map((dateStr) => {
+                  const pe = getPriorEntry(dateStr);
+                  return (
+                    <tr key={dateStr} style={{ borderTop: "1px solid var(--line)" }}>
+                      <td style={{ padding: "6px 10px", fontFamily: "var(--font-mono)", color: "var(--ink-soft)", textAlign: "center" }}>{dateStr}</td>
+                      <td style={{ padding: "6px 8px", textAlign: "center" }}>
+                        <input className="ts-input" placeholder="—" value={pe.checkin || ""} onChange={(ev) => updatePriorEntry(dateStr, "checkin", ev.target.value)} style={timeInputStyle(pe.checkin)} />
+                      </td>
+                      <td style={{ padding: "6px 8px", textAlign: "center" }}>
+                        <input className="ts-input" placeholder="—" value={pe.breakStart || ""} onChange={(ev) => updatePriorEntry(dateStr, "breakStart", ev.target.value)} style={timeInputStyle(pe.breakStart)} />
+                      </td>
+                      <td style={{ padding: "6px 8px", textAlign: "center" }}>
+                        <input className="ts-input" placeholder="—" value={pe.breakEnd || ""} onChange={(ev) => updatePriorEntry(dateStr, "breakEnd", ev.target.value)} style={timeInputStyle(pe.breakEnd)} />
+                      </td>
+                      <td style={{ padding: "6px 8px", textAlign: "center" }}>
+                        <input className="ts-input" placeholder="—" value={pe.checkout || ""} onChange={(ev) => updatePriorEntry(dateStr, "checkout", ev.target.value)} style={timeInputStyle(pe.checkout)} />
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
         {/* Config panel */}
         <div className="no-print" style={{ background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 10, padding: "20px 24px", marginBottom: 16 }}>
           <div style={{ fontFamily: "var(--font-display)", fontWeight: 600, fontSize: 15, color: "var(--ink)", marginBottom: 14 }}>
@@ -970,6 +1289,45 @@ function WeeklyTimesheetCalculator() {
           </table>
         </div>
 
+        <div style={{ background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 10, marginBottom: 20, overflow: "hidden" }}>
+          <div style={{ padding: "12px 20px", borderBottom: "1px solid var(--line)", fontFamily: "var(--font-display)", fontWeight: 600, fontSize: 14, color: "var(--ink)" }}>
+            連続7日間チェック(どの曜日から数えても28時間以内か)
+          </div>
+          <div style={{ padding: "14px 20px" }}>
+            <p style={{ fontSize: 12, color: "var(--ink-soft)", marginTop: 0, marginBottom: 12, lineHeight: 1.6 }}>
+              資格外活動の週28時間ルールは「日曜〜土曜」ではなく「連続する7日間(どの曜日を起点にしても)」で判定されます。
+              このチェックは、表示期間内の各日を終点として、その日を含む直近7日間の合計を確認しています。
+              ※期間の最初の数日を正確に判定するには、上部の「前期間末の参考データ」に前の6日分を入力してください(未入力の場合、期間開始前は0時間として計算されます)。
+            </p>
+            {rollingViolations.length === 0 ? (
+              <div style={{ fontSize: 13, color: "var(--accent)", fontWeight: 600 }}>
+                この期間内で、連続7日間28時間超過は検出されませんでした。
+              </div>
+            ) : (
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+                <thead>
+                  <tr style={{ background: "var(--warn-soft)", color: "var(--warn)" }}>
+                    {["終点の日", "対象7日間", "合計"].map((h) => (
+                      <th key={h} style={{ padding: "8px 10px", textAlign: "center", fontWeight: 600 }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {rollingViolations.map((r) => (
+                    <tr key={r.dateStr} style={{ borderTop: "1px solid var(--line)" }}>
+                      <td style={{ padding: "6px 10px", textAlign: "center", fontFamily: "var(--font-mono)" }}>{r.dateStr}</td>
+                      <td style={{ padding: "6px 10px", textAlign: "center", fontFamily: "var(--font-mono)", color: "var(--ink-soft)" }}>
+                        {toDateStr(addDays(r.dateStr, -6))} 〜 {r.dateStr}
+                      </td>
+                      <td style={{ padding: "6px 10px", textAlign: "center", fontFamily: "var(--font-mono)", fontWeight: 700, color: "var(--warn)" }}>{formatDuration(r.total)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </div>
+
         {/* Weeks */}
         {weeks.map((days, wi) => {
           const summary = weekSummaries[wi];
@@ -1017,7 +1375,8 @@ function WeeklyTimesheetCalculator() {
                               value={e.checkin}
                               onChange={(ev) => updateEntry(dateStr, "checkin", ev.target.value)}
                               onClick={() => confirmAutoField(dateStr, "checkin")}
-                              style={e.auto && e.auto.checkin ? { background: "#FDF3D9", borderColor: "#C9A227" } : undefined}
+                              title={isInvalidTimeInput(e.checkin) ? "時刻として認識できません(例: 13:17)" : undefined}
+                              style={timeInputStyle(e.checkin, e.auto && e.auto.checkin)}
                             />
                           </td>
                           <td style={{ padding: "6px 8px", textAlign: "center" }}>
@@ -1027,7 +1386,8 @@ function WeeklyTimesheetCalculator() {
                               value={e.breakStart}
                               onChange={(ev) => updateEntry(dateStr, "breakStart", ev.target.value)}
                               onClick={() => confirmAutoField(dateStr, "breakStart")}
-                              style={e.auto && e.auto.breakStart ? { background: "#FDF3D9", borderColor: "#C9A227" } : undefined}
+                              title={isInvalidTimeInput(e.breakStart) ? "時刻として認識できません(例: 12:00)" : undefined}
+                              style={timeInputStyle(e.breakStart, e.auto && e.auto.breakStart)}
                             />
                           </td>
                           <td style={{ padding: "6px 8px", textAlign: "center" }}>
@@ -1037,7 +1397,8 @@ function WeeklyTimesheetCalculator() {
                               value={e.breakEnd}
                               onChange={(ev) => updateEntry(dateStr, "breakEnd", ev.target.value)}
                               onClick={() => confirmAutoField(dateStr, "breakEnd")}
-                              style={e.auto && e.auto.breakEnd ? { background: "#FDF3D9", borderColor: "#C9A227" } : undefined}
+                              title={isInvalidTimeInput(e.breakEnd) ? "時刻として認識できません(例: 13:00)" : undefined}
+                              style={timeInputStyle(e.breakEnd, e.auto && e.auto.breakEnd)}
                             />
                           </td>
                           <td style={{ padding: "6px 8px", textAlign: "center" }}>
@@ -1047,7 +1408,8 @@ function WeeklyTimesheetCalculator() {
                               value={e.checkout}
                               onChange={(ev) => updateEntry(dateStr, "checkout", ev.target.value)}
                               onClick={() => confirmAutoField(dateStr, "checkout")}
-                              style={e.auto && e.auto.checkout ? { background: "#FDF3D9", borderColor: "#C9A227" } : undefined}
+                              title={isInvalidTimeInput(e.checkout) ? "時刻として認識できません(例: 18:30)" : undefined}
+                              style={timeInputStyle(e.checkout, e.auto && e.auto.checkout)}
                             />
                           </td>
                           <td style={{ padding: "6px 10px", textAlign: "center", fontFamily: "var(--font-mono)", color: "var(--ink-soft)" }}>
@@ -1101,4 +1463,4 @@ function WeeklyTimesheetCalculator() {
 }
 
 const rootEl = document.getElementById("root");
-ReactDOM.createRoot(rootEl).render(<WeeklyTimesheetCalculator />);
+ReactDOM.createRoot(rootEl).render(<EmployeeTimesheet />);
