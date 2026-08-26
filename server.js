@@ -252,11 +252,13 @@ function findTimesInRow(rowTokens) {
   return { joined, times: results };
 }
 
-// 行の左端(日付列)から日付を取り出す。
-// 「21火」のように結合される場合も、文字がバラバラの場合も拾えるよう文字単位で探す。
-// 「13:17」のような時刻を日付と誤認しないよう、直後がコロンや数字なら除外する。
-function findDayInRow(rowTokens, leftBoundaryX) {
-  const charSeq = buildCharSeq(rowTokens).filter((c) => leftBoundaryX == null || c.x < leftBoundaryX);
+// 行から日付を取り出す。
+// 用紙が傾いていると列の絶対座標がずれるため、
+// 「その行で最初に現れる時刻より左側」という相対的な条件で日付列を判定する。
+// 「13:17」を日付と誤認しないよう、直後がコロンや数字なら除外する。
+function findDayInRow(rowTokens, firstTimeX, fallbackBoundaryX) {
+  const boundary = firstTimeX != null ? firstTimeX : fallbackBoundaryX;
+  const charSeq = buildCharSeq(rowTokens).filter((c) => boundary == null || c.x < boundary);
   if (charSeq.length === 0) return null;
   const joined = charSeq.map((c) => c.ch).join("");
   const re = /(\d{1,2})(?![\d:])/g;
@@ -349,31 +351,26 @@ function extractRowsFromVision(annotations) {
     return y > header.headerY + medianHeight * 0.5;
   });
 
-  // 日付列との境界:曜日ヘッダーの右端(なければ出社ヘッダーの左端)
-  const leftBoundaryX = header
+  // 日付列の境界(時刻が1つも無い行のための予備)
+  const fallbackBoundaryX = header
     ? header.dowXMax != null
       ? header.dowXMax
-      : header.checkinXMin != null
-      ? header.checkinXMin
-      : header.checkin - medianHeight * 3
+      : header.checkinXMin
     : null;
 
   const perRow = dataRowGroups.map((rowTokens) => {
     const { joined, times } = findTimesInRow(rowTokens);
-    const day = findDayInRow(rowTokens, leftBoundaryX);
+    const firstTimeX = times.length > 0 ? Math.min(...times.map((t) => t.x)) : null;
+    const day = findDayInRow(rowTokens, firstTimeX, fallbackBoundaryX);
     return { rowTokens, joined, times, day };
   });
 
   // 行内の時刻を「左から順に」出社→(休憩)→退社と割り当てる。
-  // 手書きは列内で左右にぶれるため、ヘッダー中心からの距離より並び順の方が安定する。
+  // 手書きは列内で左右にぶれるうえ用紙も傾くため、
+  // ヘッダー中心からの距離より並び順の方が安定する。
   // 休憩欄はほぼ空欄で運用されているため、2個なら出社・退社とみなすのが実態に合う。
-  const rightLimit = header ? header.checkout + (header.checkout - header.checkin) * 0.6 : null;
-
   function assignRowTimes(times) {
-    // 退社列より大きく右にある時刻(勤務時間・残業時間欄の誤検出)は除外
-    const valid = times
-      .filter((t) => (rightLimit == null ? true : t.x <= rightLimit))
-      .sort((a, b) => a.x - b.x);
+    const valid = [...times].sort((a, b) => a.x - b.x);
 
     const entry = { checkin: "", breakStart: "", breakEnd: "", checkout: "" };
     if (valid.length === 0) return entry;
@@ -426,8 +423,14 @@ function extractRowsFromVision(annotations) {
       tokenCount: tokens.length,
       rowCount: dataRowGroups.length,
       rowsWithDay: out.length,
+      rowsWithTimes: perRow.filter((r) => r.times.length > 0).length,
       timeCount,
       headerFound: !!header,
+      // 日付が取れなかったが時刻はある行の例(原因調査用)
+      sampleUnmatched: perRow
+        .filter((r) => r.day == null && r.times.length > 0)
+        .slice(0, 2)
+        .map((r) => r.joined.slice(0, 40)),
     },
   };
 }
@@ -515,7 +518,12 @@ async function runGoogleVisionOcr({ imageBase64, isPdf }) {
       employeeName: "",
       workplaceName: "",
       provider: "google",
-      note: `解析内訳: 検出文字${debug.tokenCount}個 / 行${debug.rowCount} / 日付付き行${debug.rowsWithDay} / 時刻${debug.timeCount}個 / ヘッダー検出${debug.headerFound ? "成功" : "失敗"}。氏名・就業先の自動判別は行いません。`,
+      note:
+        `解析内訳: 文字${debug.tokenCount} / 行${debug.rowCount} / 時刻あり行${debug.rowsWithTimes} / 日付付き行${debug.rowsWithDay} / 反映時刻${debug.timeCount} / ヘッダー${debug.headerFound ? "OK" : "NG"}。` +
+        (debug.sampleUnmatched && debug.sampleUnmatched.length
+          ? ` 日付が取れなかった行の例: ${debug.sampleUnmatched.map((s) => `「${s}」`).join(" ")}`
+          : "") +
+        ` 氏名・就業先の自動判別は行いません。`,
     },
   };
 }
