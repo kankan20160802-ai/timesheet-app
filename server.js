@@ -235,18 +235,8 @@ function groupTokensIntoRows(tokens, medianHeight) {
 
 // 1行分の文字列を組み立て、時刻とその位置(X座標)を取り出す
 function findTimesInRow(rowTokens) {
-  const chars = [];
-  rowTokens.forEach((t) => chars.push(...expandTokenToChars(t)));
-
-  // 全角を半角に寄せてから探す
-  const normalized = chars.map((c) => {
-    let ch = c.ch;
-    if (ch >= "０" && ch <= "９") ch = String.fromCharCode(ch.charCodeAt(0) - 0xfee0);
-    if ("：；;．。・".includes(ch)) ch = ":";
-    return { ch, x: c.x };
-  });
-
-  const joined = normalized.map((c) => c.ch).join("");
+  const charSeq = buildCharSeq(rowTokens);
+  const joined = charSeq.map((c) => c.ch).join("");
   const results = [];
   const re = /(\d{1,2}):(\d{2})/g;
   let m;
@@ -256,59 +246,79 @@ function findTimesInRow(rowTokens) {
     if (h > 23 || mm > 59) continue;
     const startIdx = m.index;
     const endIdx = m.index + m[0].length - 1;
-    const xCenter = (normalized[startIdx].x + normalized[endIdx].x) / 2;
+    const xCenter = (charSeq[startIdx].x + charSeq[endIdx].x) / 2;
     results.push({ time: `${String(h).padStart(2, "0")}:${String(mm).padStart(2, "0")}`, x: xCenter });
   }
   return { joined, times: results };
 }
 
-// 行頭付近の数字を日付として取り出す。
-// 「21火」のように曜日と結合して認識される場合があるため、先頭の数字を抽出する。
-// ただし「13:17」のような時刻を日付と誤認しないよう、直後がコロンや数字の場合は除外する。
+// 行の左端(日付列)から日付を取り出す。
+// 「21火」のように結合される場合も、文字がバラバラの場合も拾えるよう文字単位で探す。
+// 「13:17」のような時刻を日付と誤認しないよう、直後がコロンや数字なら除外する。
 function findDayInRow(rowTokens, leftBoundaryX) {
-  for (const t of rowTokens) {
-    // 日付列より右側は対象外
-    if (leftBoundaryX != null && t.xMin >= leftBoundaryX) break;
-    const norm = t.text
-      .replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0))
-      .replace(/[：；．。・]/g, ":")
-      .trim();
-    const m = /^(\d{1,2})(?![\d:])/.exec(norm);
-    if (m) {
-      const d = parseInt(m[1], 10);
-      if (d >= 1 && d <= 31) return d;
-    }
+  const charSeq = buildCharSeq(rowTokens).filter((c) => leftBoundaryX == null || c.x < leftBoundaryX);
+  if (charSeq.length === 0) return null;
+  const joined = charSeq.map((c) => c.ch).join("");
+  const re = /(\d{1,2})(?![\d:])/g;
+  let m;
+  while ((m = re.exec(joined)) !== null) {
+    const d = parseInt(m[1], 10);
+    if (d >= 1 && d <= 31) return d;
   }
   return null;
 }
 
-// 表ヘッダー(日付・曜日・出社・休憩・退社)を見つけ、列の基準にする。
-function findHeaderAnchors(tokens) {
-  const anchors = {};
-  let headerY = null;
-
-  tokens.forEach((t) => {
-    const txt = t.text;
-    const xc = (t.xMin + t.xMax) / 2;
-    if (/曜日/.test(txt) && anchors.dowXMax == null) {
-      anchors.dowXMax = t.xMax;
-    } else if (/出社|出勤/.test(txt) && anchors.checkin == null) {
-      anchors.checkin = xc;
-      anchors.checkinXMin = t.xMin;
-      headerY = t.yCenter;
-    } else if (/休憩/.test(txt) && anchors.breakCenter == null) {
-      anchors.breakCenter = xc;
-      anchors.breakXMin = t.xMin;
-      anchors.breakXMax = t.xMax;
-    } else if (/退社|退勤/.test(txt) && anchors.checkout == null) {
-      anchors.checkout = xc;
-      anchors.checkoutXMin = t.xMin;
-      if (headerY == null) headerY = t.yCenter;
-    }
+// 行の文字列を、1文字ずつのX座標付きで組み立てる(全角も半角に正規化する)
+function buildCharSeq(rowTokens) {
+  const chars = [];
+  rowTokens.forEach((t) => chars.push(...expandTokenToChars(t)));
+  return chars.map((c) => {
+    let ch = c.ch;
+    if (ch >= "０" && ch <= "９") ch = String.fromCharCode(ch.charCodeAt(0) - 0xfee0);
+    if ("：；;．。・.".includes(ch)) ch = ":";
+    return { ch, x: c.x };
   });
+}
 
-  if (anchors.checkin == null || anchors.checkout == null) return null;
-  return { ...anchors, headerY };
+// 行内の文字列から、指定パターンの出現位置(X座標)を求める
+function locateInRow(charSeq, joined, pattern) {
+  const m = pattern.exec(joined);
+  if (!m) return null;
+  const s = m.index;
+  const e = m.index + m[0].length - 1;
+  return {
+    xMin: charSeq[s].x,
+    xMax: charSeq[e].x,
+    xCenter: (charSeq[s].x + charSeq[e].x) / 2,
+  };
+}
+
+// 表ヘッダー行を探し、各列のX位置を求める。
+// Google Vision は日本語を1文字ずつ返すことがあるため、
+// トークン単位ではなく「行の文字列」として探す必要がある。
+function findHeaderAnchors(rowGroups) {
+  for (const rowTokens of rowGroups) {
+    const charSeq = buildCharSeq(rowTokens);
+    const joined = charSeq.map((c) => c.ch).join("");
+    const inPos = locateInRow(charSeq, joined, /出社|出勤/);
+    const outPos = locateInRow(charSeq, joined, /退社|退勤/);
+    if (!inPos || !outPos || outPos.xCenter <= inPos.xCenter) continue;
+
+    const dowPos = locateInRow(charSeq, joined, /曜日|曜/);
+    const breakPos = locateInRow(charSeq, joined, /休憩|休/);
+    const headerY = rowTokens.reduce((s, t) => s + t.yCenter, 0) / rowTokens.length;
+
+    return {
+      checkin: inPos.xCenter,
+      checkinXMin: inPos.xMin,
+      checkout: outPos.xCenter,
+      checkoutXMin: outPos.xMin,
+      dowXMax: dowPos ? dowPos.xMax : null,
+      breakCenter: breakPos ? breakPos.xCenter : null,
+      headerY,
+    };
+  }
+  return null;
 }
 
 function extractRowsFromVision(annotations) {
@@ -329,8 +339,8 @@ function extractRowsFromVision(annotations) {
   const heights = tokens.map((t) => t.height).sort((a, b) => a - b);
   const medianHeight = heights[Math.floor(heights.length / 2)] || 10;
 
-  const header = findHeaderAnchors(tokens);
   const rowGroups = groupTokensIntoRows(tokens, medianHeight);
+  const header = findHeaderAnchors(rowGroups);
 
   // ヘッダーより上の行(タイトルや注意書き)は集計対象から除外する
   const dataRowGroups = rowGroups.filter((rowTokens) => {
